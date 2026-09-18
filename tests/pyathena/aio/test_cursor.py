@@ -18,6 +18,34 @@ from tests.pyathena.aio.conftest import _aio_connect
 
 
 class TestAioCursor:
+    @pytest.fixture
+    def mock_cursor(self):
+        cursor = AioCursor(
+            connection=MagicMock(_client_kwargs={}),
+            converter=DefaultTypeConverter(),
+            formatter=DefaultParameterFormatter(),
+            retry_config=RetryConfig(),
+        )
+        with (
+            patch.object(cursor, "_execute", new_callable=AsyncMock, return_value="query-id"),
+            patch.object(
+                cursor,
+                "_poll",
+                new_callable=AsyncMock,
+                return_value=MagicMock(state="SUCCEEDED", substatement_type="UPDATE"),
+            ),
+        ):
+            yield cursor
+
+    def _set_update_counts(self, cursor, counts):
+        cursor.connection.client.get_query_results.side_effect = [
+            {
+                "ResultSet": {"ResultSetMetadata": {"ColumnInfo": []}, "Rows": []},
+                **({"UpdateCount": count} if count is not None else {}),
+            }
+            for count in counts
+        ]
+
     async def test_fetchone(self, aio_cursor):
         await aio_cursor.execute("SELECT * FROM one_row")
         assert aio_cursor.rowcount == -1
@@ -283,120 +311,6 @@ class TestAioCursor:
         await aio_cursor.execute("SELECT * FROM execute_many_aio")
         assert sorted(await aio_cursor.fetchall()) == list(rows)
 
-    async def test_executemany_fetch(self, aio_cursor):
-        await aio_cursor.executemany("SELECT %(x)d FROM one_row", [{"x": i} for i in range(1, 2)])
-        with pytest.raises(ProgrammingError):
-            await aio_cursor.fetchall()
-        with pytest.raises(ProgrammingError):
-            await aio_cursor.fetchmany()
-        with pytest.raises(ProgrammingError):
-            await aio_cursor.fetchone()
-
-    async def test_context_manager(self):
-        conn = await _aio_connect(schema_name=ENV.schema)
-        try:
-            async with conn.cursor() as cursor:
-                await cursor.execute("SELECT * FROM one_row")
-                assert await cursor.fetchone() == (1,)
-        finally:
-            conn.close()
-
-    async def test_open_close(self):
-        conn = await _aio_connect()
-        conn.close()
-
-    async def test_aio_connect(self):
-        from pyathena import aio_connect
-
-        conn = await aio_connect(work_group=ENV.default_work_group)
-        async with conn.cursor() as cursor:
-            await cursor.execute("SELECT 1")
-            assert await cursor.fetchone() == (1,)
-        conn.close()
-
-    async def test_arraysize(self, aio_cursor):
-        aio_cursor.arraysize = 5
-        await aio_cursor.execute("SELECT * FROM many_rows LIMIT 20")
-        actual = await aio_cursor.fetchmany()
-        assert len(actual) == 5
-
-    async def test_arraysize_default(self, aio_cursor):
-        assert aio_cursor.arraysize == AthenaResultSet.DEFAULT_FETCH_SIZE
-
-    async def test_invalid_arraysize(self, aio_cursor):
-        with pytest.raises(ProgrammingError):
-            aio_cursor.arraysize = 10000
-        with pytest.raises(ProgrammingError):
-            aio_cursor.arraysize = -1
-
-    async def test_list_databases(self, aio_cursor):
-        databases = await aio_cursor.list_databases(catalog_name="AwsDataCatalog")
-        assert len(databases) > 0
-        database_names = [db.name for db in databases]
-        assert "default" in database_names
-
-    async def test_get_table_metadata(self, aio_cursor):
-        metadata = await aio_cursor.get_table_metadata(table_name="one_row")
-        assert metadata.name == "one_row"
-        assert metadata.table_type
-
-    async def test_list_table_metadata(self, aio_cursor):
-        metadata_list = await aio_cursor.list_table_metadata()
-        assert len(metadata_list) > 0
-        table_names = [m.name for m in metadata_list]
-        assert "one_row" in table_names
-
-
-class TestAioDictCursor:
-    async def test_fetchone(self, aio_dict_cursor):
-        await aio_dict_cursor.execute("SELECT * FROM one_row")
-        assert await aio_dict_cursor.fetchone() == {"number_of_rows": 1}
-
-    async def test_fetchmany(self, aio_dict_cursor):
-        await aio_dict_cursor.execute("SELECT * FROM many_rows LIMIT 15")
-        actual1 = await aio_dict_cursor.fetchmany(10)
-        assert len(actual1) == 10
-        assert actual1 == [{"a": i} for i in range(10)]
-        actual2 = await aio_dict_cursor.fetchmany(10)
-        assert len(actual2) == 5
-        assert actual2 == [{"a": i} for i in range(10, 15)]
-
-    async def test_fetchall(self, aio_dict_cursor):
-        await aio_dict_cursor.execute("SELECT * FROM one_row")
-        assert await aio_dict_cursor.fetchall() == [{"number_of_rows": 1}]
-        await aio_dict_cursor.execute("SELECT a FROM many_rows ORDER BY a")
-        assert await aio_dict_cursor.fetchall() == [{"a": i} for i in range(10000)]
-
-
-class TestAioCursorExecutemany:
-    @pytest.fixture
-    def mock_cursor(self):
-        cursor = AioCursor(
-            connection=MagicMock(_client_kwargs={}),
-            converter=DefaultTypeConverter(),
-            formatter=DefaultParameterFormatter(),
-            retry_config=RetryConfig(),
-        )
-        with (
-            patch.object(cursor, "_execute", new_callable=AsyncMock, return_value="query-id"),
-            patch.object(
-                cursor,
-                "_poll",
-                new_callable=AsyncMock,
-                return_value=MagicMock(state="SUCCEEDED", substatement_type="UPDATE"),
-            ),
-        ):
-            yield cursor
-
-    def _set_update_counts(self, cursor, counts):
-        cursor.connection.client.get_query_results.side_effect = [
-            {
-                "ResultSet": {"ResultSetMetadata": {"ColumnInfo": []}, "Rows": []},
-                **({"UpdateCount": count} if count is not None else {}),
-            }
-            for count in counts
-        ]
-
     @pytest.mark.parametrize(
         ("counts", "expected"),
         [
@@ -516,3 +430,87 @@ class TestAioCursorExecutemany:
         cursor._cancel = AsyncMock()
         await cursor.cancel()
         cursor._cancel.assert_awaited_once_with("query-id")
+
+    async def test_executemany_fetch(self, aio_cursor):
+        await aio_cursor.executemany("SELECT %(x)d FROM one_row", [{"x": i} for i in range(1, 2)])
+        with pytest.raises(ProgrammingError):
+            await aio_cursor.fetchall()
+        with pytest.raises(ProgrammingError):
+            await aio_cursor.fetchmany()
+        with pytest.raises(ProgrammingError):
+            await aio_cursor.fetchone()
+
+    async def test_context_manager(self):
+        conn = await _aio_connect(schema_name=ENV.schema)
+        try:
+            async with conn.cursor() as cursor:
+                await cursor.execute("SELECT * FROM one_row")
+                assert await cursor.fetchone() == (1,)
+        finally:
+            conn.close()
+
+    async def test_open_close(self):
+        conn = await _aio_connect()
+        conn.close()
+
+    async def test_aio_connect(self):
+        from pyathena import aio_connect
+
+        conn = await aio_connect(work_group=ENV.default_work_group)
+        async with conn.cursor() as cursor:
+            await cursor.execute("SELECT 1")
+            assert await cursor.fetchone() == (1,)
+        conn.close()
+
+    async def test_arraysize(self, aio_cursor):
+        aio_cursor.arraysize = 5
+        await aio_cursor.execute("SELECT * FROM many_rows LIMIT 20")
+        actual = await aio_cursor.fetchmany()
+        assert len(actual) == 5
+
+    async def test_arraysize_default(self, aio_cursor):
+        assert aio_cursor.arraysize == AthenaResultSet.DEFAULT_FETCH_SIZE
+
+    async def test_invalid_arraysize(self, aio_cursor):
+        with pytest.raises(ProgrammingError):
+            aio_cursor.arraysize = 10000
+        with pytest.raises(ProgrammingError):
+            aio_cursor.arraysize = -1
+
+    async def test_list_databases(self, aio_cursor):
+        databases = await aio_cursor.list_databases(catalog_name="AwsDataCatalog")
+        assert len(databases) > 0
+        database_names = [db.name for db in databases]
+        assert "default" in database_names
+
+    async def test_get_table_metadata(self, aio_cursor):
+        metadata = await aio_cursor.get_table_metadata(table_name="one_row")
+        assert metadata.name == "one_row"
+        assert metadata.table_type
+
+    async def test_list_table_metadata(self, aio_cursor):
+        metadata_list = await aio_cursor.list_table_metadata()
+        assert len(metadata_list) > 0
+        table_names = [m.name for m in metadata_list]
+        assert "one_row" in table_names
+
+
+class TestAioDictCursor:
+    async def test_fetchone(self, aio_dict_cursor):
+        await aio_dict_cursor.execute("SELECT * FROM one_row")
+        assert await aio_dict_cursor.fetchone() == {"number_of_rows": 1}
+
+    async def test_fetchmany(self, aio_dict_cursor):
+        await aio_dict_cursor.execute("SELECT * FROM many_rows LIMIT 15")
+        actual1 = await aio_dict_cursor.fetchmany(10)
+        assert len(actual1) == 10
+        assert actual1 == [{"a": i} for i in range(10)]
+        actual2 = await aio_dict_cursor.fetchmany(10)
+        assert len(actual2) == 5
+        assert actual2 == [{"a": i} for i in range(10, 15)]
+
+    async def test_fetchall(self, aio_dict_cursor):
+        await aio_dict_cursor.execute("SELECT * FROM one_row")
+        assert await aio_dict_cursor.fetchall() == [{"number_of_rows": 1}]
+        await aio_dict_cursor.execute("SELECT a FROM many_rows ORDER BY a")
+        assert await aio_dict_cursor.fetchall() == [{"a": i} for i in range(10000)]
