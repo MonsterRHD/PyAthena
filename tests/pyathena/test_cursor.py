@@ -16,9 +16,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from pyathena import BINARY, BOOLEAN, DATE, DATETIME, JSON, NUMBER, STRING, TIME, ExecuteOptions
-from pyathena.converter import _to_array, _to_map, _to_struct
+from pyathena.converter import DefaultTypeConverter, _to_array, _to_map, _to_struct
 from pyathena.cursor import Cursor
-from pyathena.error import DatabaseError, NotSupportedError, ProgrammingError
+from pyathena.error import DatabaseError, NotSupportedError, OperationalError, ProgrammingError
+from pyathena.formatter import DefaultParameterFormatter
 from pyathena.model import AthenaQueryExecution
 from pyathena.util import RetryConfig
 from tests import ENV
@@ -1664,3 +1665,135 @@ class TestComplexDataTypes:
             assert result == expected, (
                 f"Converter failed for {test_input}: expected {expected}, got {result}"
             )
+
+
+class TestCursorExecutemany:
+    @pytest.fixture
+    def mock_cursor(self):
+        cursor = Cursor(
+            connection=MagicMock(_client_kwargs={}),
+            converter=DefaultTypeConverter(),
+            formatter=DefaultParameterFormatter(),
+            retry_config=RetryConfig(),
+        )
+        with (
+            patch.object(cursor, "_execute", new_callable=MagicMock, return_value="query-id"),
+            patch.object(
+                cursor,
+                "_poll",
+                new_callable=MagicMock,
+                return_value=MagicMock(state="SUCCEEDED", substatement_type="UPDATE"),
+            ),
+        ):
+            yield cursor
+
+    def _set_update_counts(self, cursor, counts):
+        cursor.connection.client.get_query_results.side_effect = [
+            {
+                "ResultSet": {"ResultSetMetadata": {"ColumnInfo": []}, "Rows": []},
+                **({"UpdateCount": count} if count is not None else {}),
+            }
+            for count in counts
+        ]
+
+    @pytest.mark.parametrize(
+        ("counts", "expected"),
+        [
+            ([1, 1, 0], 2),
+            ([0, 0], 0),
+            ([4], 4),
+            ([], 0),
+            ([1, None, 3], -1),
+            ([None, 2], -1),
+            ([1, None], -1),
+        ],
+    )
+    def test_executemany_rowcount(self, mock_cursor, counts, expected):
+        cursor = mock_cursor
+        self._set_update_counts(cursor, counts)
+        parameters = [{"id": index} for index in range(len(counts))]
+        assert cursor.rowcount == -1
+        result = cursor.executemany(
+            "UPDATE t SET x=1 WHERE id=%(id)s", parameters, work_group="test-workgroup"
+        )
+        assert result is None
+        assert cursor.rowcount == expected
+        assert cursor.description is None
+        assert cursor.result_set is None
+        assert cursor.query_id is None
+        assert cursor._execute.call_count == len(counts)
+        assert cursor.connection.client.get_query_results.call_count == len(counts)
+        for call, parameters_item in zip(cursor._execute.call_args_list, parameters, strict=True):
+            assert call.kwargs["parameters"] == parameters_item
+            assert call.kwargs["options"].work_group == "test-workgroup"
+        cursor.close()
+        assert cursor.rowcount == -1
+
+    def test_executemany_replaces_previous_state(self, mock_cursor):
+        cursor = mock_cursor
+        self._set_update_counts(cursor, [5, 2, 1, 4, 0])
+        cursor.execute("UPDATE t SET x=1")
+        previous = cursor.result_set
+        cursor.executemany("UPDATE t SET x=1", [{}, {}])
+        assert previous.is_closed
+        assert cursor.rowcount == 3
+        cursor.executemany("UPDATE t SET x=1", [{}])
+        assert cursor.rowcount == 4
+        cursor.execute("UPDATE t SET x=1 WHERE id=99")
+        assert cursor.rowcount == 0
+        cursor.executemany("UPDATE t SET x=1", [])
+        assert cursor.rowcount == 0
+        assert cursor.description is None
+
+    def test_executemany_unknown_and_select_reset_previous_count(self, mock_cursor):
+        cursor = mock_cursor
+        self._set_update_counts(cursor, [7, None, 0, 0])
+        cursor.executemany("UPDATE t SET x=1", [{}])
+        assert cursor.rowcount == 7
+        cursor.execute("UPDATE t SET x=1")
+        assert cursor.rowcount == -1
+        cursor._poll.return_value.substatement_type = "SELECT"
+        cursor.execute("SELECT 1")
+        assert cursor.rowcount == -1
+        cursor.executemany("SELECT 1", [{}])
+        assert cursor.rowcount == -1
+        with pytest.raises(ProgrammingError, match="No result set"):
+            cursor.fetchone()
+        with pytest.raises(ProgrammingError, match="No result set"):
+            cursor.fetchmany()
+        with pytest.raises(ProgrammingError, match="No result set"):
+            cursor.fetchall()
+
+    @pytest.mark.parametrize("failure_index", [0, 1])
+    def test_executemany_failure_discards_partial_count(self, mock_cursor, failure_index):
+        cursor = mock_cursor
+        self._set_update_counts(cursor, [9, 2, 3])
+        cursor.executemany("UPDATE t SET x=1", [{}])
+        error = OperationalError("execution failed")
+        execution = cursor._poll.return_value
+        cursor._poll.side_effect = [execution] * failure_index + [error]
+        with pytest.raises(OperationalError, match="execution failed") as caught:
+            cursor.executemany("UPDATE t SET x=1", [{}, {}, {}])
+        assert caught.value is error
+        assert cursor.rowcount == -1
+        assert cursor.description is None
+        assert cursor.result_set is None
+        assert cursor.query_id == "query-id"
+        cursor._poll.side_effect = None
+        self._set_update_counts(cursor, [3])
+        cursor.execute("UPDATE t SET x=1")
+        assert cursor.rowcount == 3
+
+    def test_executemany_parameter_iteration_failure(self, mock_cursor):
+        cursor = mock_cursor
+        self._set_update_counts(cursor, [2])
+
+        def parameters():
+            yield {}
+            raise ValueError("invalid parameters")
+
+        with pytest.raises(ValueError, match="invalid parameters"):
+            cursor.executemany("UPDATE t SET x=1", parameters())
+        assert cursor.rowcount == -1
+        assert cursor.result_set is None
+        assert cursor.query_id == "query-id"

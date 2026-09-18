@@ -457,7 +457,8 @@ class WithAsyncFetch(AioBaseCursor, CursorIterator, WithResultSet):
                 rowcount = rowcount + count if rowcount >= 0 and count >= 0 else -1
         except BaseException:
             # Keep the query ID available for diagnostics and explicit cancellation.
-            self._reset_state(preserve_query_id=True)
+            self.close()
+            self.result_set = None
             raise
         self._reset_state()
         self._rowcount = rowcount

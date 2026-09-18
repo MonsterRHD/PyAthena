@@ -1,8 +1,14 @@
+import asyncio
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 import sqlalchemy
 from sqlalchemy import text
 from sqlalchemy.sql.schema import MetaData, Table
+from sqlalchemy.util.concurrency import greenlet_spawn
 
+from pyathena.aio.sqlalchemy.base import AsyncAdapt_pyathena_cursor
+from pyathena.error import OperationalError
 from tests import ENV
 
 
@@ -98,3 +104,45 @@ class TestAsyncSQLAlchemyAthena:
         assert actual["default"] is None
         assert not actual["autoincrement"]
         assert actual["comment"] == "some comment"
+
+
+class TestAsyncAdaptPyAthenaCursor:
+    @pytest.mark.parametrize("rowcount", [2, 0, -1])
+    async def test_executemany(self, rowcount):
+        aio_cursor = MagicMock(rowcount=rowcount, description=None)
+        aio_cursor.executemany = AsyncMock()
+        cursor = AsyncAdapt_pyathena_cursor(aio_cursor)
+        cursor._rows.append(("previous query",))
+        parameters = [{"id": 1}, {"id": 2}]
+
+        result = await greenlet_spawn(
+            cursor.executemany,
+            "UPDATE t SET x=1 WHERE id=%(id)s",
+            parameters,
+            work_group="test-workgroup",
+        )
+
+        assert result is None
+        aio_cursor.executemany.assert_awaited_once_with(
+            "UPDATE t SET x=1 WHERE id=%(id)s", parameters, work_group="test-workgroup"
+        )
+        aio_cursor.execute.assert_not_called()
+        assert cursor.rowcount == rowcount
+        assert cursor.description is None
+        assert cursor.fetchall() == []
+
+    @pytest.mark.parametrize(
+        "error", [OperationalError("execution failed"), asyncio.CancelledError()]
+    )
+    async def test_executemany_failure_clears_buffered_rows(self, error):
+        aio_cursor = MagicMock()
+        aio_cursor.executemany = AsyncMock(side_effect=error)
+        cursor = AsyncAdapt_pyathena_cursor(aio_cursor)
+        cursor._rows.append(("previous query",))
+
+        with pytest.raises(type(error)) as caught:
+            await greenlet_spawn(cursor.executemany, "UPDATE t SET x=1", [{}])
+
+        assert caught.value is error
+        assert cursor.fetchall() == []
+        aio_cursor.executemany.assert_awaited_once_with("UPDATE t SET x=1", [{}])

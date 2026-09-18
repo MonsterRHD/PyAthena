@@ -1,3 +1,4 @@
+import asyncio
 import re
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -6,7 +7,9 @@ import pytest
 
 from pyathena import ExecuteOptions
 from pyathena.aio.cursor import AioCursor
-from pyathena.error import DatabaseError, ProgrammingError
+from pyathena.converter import DefaultTypeConverter
+from pyathena.error import DatabaseError, OperationalError, ProgrammingError
+from pyathena.formatter import DefaultParameterFormatter
 from pyathena.model import AthenaQueryExecution
 from pyathena.result_set import AthenaResultSet
 from pyathena.util import RetryConfig
@@ -363,3 +366,148 @@ class TestAioDictCursor:
         assert await aio_dict_cursor.fetchall() == [{"number_of_rows": 1}]
         await aio_dict_cursor.execute("SELECT a FROM many_rows ORDER BY a")
         assert await aio_dict_cursor.fetchall() == [{"a": i} for i in range(10000)]
+
+
+class TestAioCursorExecutemany:
+    @pytest.fixture
+    def mock_cursor(self):
+        cursor = AioCursor(
+            connection=MagicMock(_client_kwargs={}),
+            converter=DefaultTypeConverter(),
+            formatter=DefaultParameterFormatter(),
+            retry_config=RetryConfig(),
+        )
+        with (
+            patch.object(cursor, "_execute", new_callable=AsyncMock, return_value="query-id"),
+            patch.object(
+                cursor,
+                "_poll",
+                new_callable=AsyncMock,
+                return_value=MagicMock(state="SUCCEEDED", substatement_type="UPDATE"),
+            ),
+        ):
+            yield cursor
+
+    def _set_update_counts(self, cursor, counts):
+        cursor.connection.client.get_query_results.side_effect = [
+            {
+                "ResultSet": {"ResultSetMetadata": {"ColumnInfo": []}, "Rows": []},
+                **({"UpdateCount": count} if count is not None else {}),
+            }
+            for count in counts
+        ]
+
+    @pytest.mark.parametrize(
+        ("counts", "expected"),
+        [
+            ([1, 1, 0], 2),
+            ([0, 0], 0),
+            ([4], 4),
+            ([], 0),
+            ([1, None, 3], -1),
+            ([None, 2], -1),
+            ([1, None], -1),
+        ],
+    )
+    async def test_executemany_rowcount(self, mock_cursor, counts, expected):
+        cursor = mock_cursor
+        self._set_update_counts(cursor, counts)
+        parameters = [{"id": index} for index in range(len(counts))]
+        assert cursor.rowcount == -1
+        result = await cursor.executemany(
+            "UPDATE t SET x=1 WHERE id=%(id)s", parameters, work_group="test-workgroup"
+        )
+        assert result is None
+        assert cursor.rowcount == expected
+        assert cursor.description is None
+        assert cursor.result_set is None
+        assert cursor.query_id is None
+        assert cursor._execute.call_count == len(counts)
+        assert cursor.connection.client.get_query_results.call_count == len(counts)
+        for call, parameters_item in zip(cursor._execute.call_args_list, parameters, strict=True):
+            assert call.kwargs["parameters"] == parameters_item
+            assert call.kwargs["options"].work_group == "test-workgroup"
+        cursor.close()
+        assert cursor.rowcount == -1
+
+    async def test_executemany_replaces_previous_state(self, mock_cursor):
+        cursor = mock_cursor
+        self._set_update_counts(cursor, [5, 2, 1, 4, 0])
+        await cursor.execute("UPDATE t SET x=1")
+        previous = cursor.result_set
+        await cursor.executemany("UPDATE t SET x=1", [{}, {}])
+        assert previous.is_closed
+        assert cursor.rowcount == 3
+        await cursor.executemany("UPDATE t SET x=1", [{}])
+        assert cursor.rowcount == 4
+        await cursor.execute("UPDATE t SET x=1 WHERE id=99")
+        assert cursor.rowcount == 0
+        await cursor.executemany("UPDATE t SET x=1", [])
+        assert cursor.rowcount == 0
+        assert cursor.description is None
+
+    async def test_executemany_unknown_and_select_reset_previous_count(self, mock_cursor):
+        cursor = mock_cursor
+        self._set_update_counts(cursor, [7, None, 0, 0])
+        await cursor.executemany("UPDATE t SET x=1", [{}])
+        assert cursor.rowcount == 7
+        await cursor.execute("UPDATE t SET x=1")
+        assert cursor.rowcount == -1
+        cursor._poll.return_value.substatement_type = "SELECT"
+        await cursor.execute("SELECT 1")
+        assert cursor.rowcount == -1
+        await cursor.executemany("SELECT 1", [{}])
+        assert cursor.rowcount == -1
+        with pytest.raises(ProgrammingError, match="No result set"):
+            await cursor.fetchone()
+        with pytest.raises(ProgrammingError, match="No result set"):
+            await cursor.fetchmany()
+        with pytest.raises(ProgrammingError, match="No result set"):
+            await cursor.fetchall()
+
+    @pytest.mark.parametrize("failure_index", [0, 1])
+    async def test_executemany_failure_discards_partial_count(self, mock_cursor, failure_index):
+        cursor = mock_cursor
+        self._set_update_counts(cursor, [9, 2, 3])
+        await cursor.executemany("UPDATE t SET x=1", [{}])
+        error = OperationalError("execution failed")
+        execution = cursor._poll.return_value
+        cursor._poll.side_effect = [execution] * failure_index + [error]
+        with pytest.raises(OperationalError, match="execution failed") as caught:
+            await cursor.executemany("UPDATE t SET x=1", [{}, {}, {}])
+        assert caught.value is error
+        assert cursor.rowcount == -1
+        assert cursor.description is None
+        assert cursor.result_set is None
+        assert cursor.query_id == "query-id"
+        cursor._poll.side_effect = None
+        self._set_update_counts(cursor, [3])
+        await cursor.execute("UPDATE t SET x=1")
+        assert cursor.rowcount == 3
+
+    async def test_executemany_parameter_iteration_failure(self, mock_cursor):
+        cursor = mock_cursor
+        self._set_update_counts(cursor, [2])
+
+        def parameters():
+            yield {}
+            raise ValueError("invalid parameters")
+
+        with pytest.raises(ValueError, match="invalid parameters"):
+            await cursor.executemany("UPDATE t SET x=1", parameters())
+        assert cursor.rowcount == -1
+        assert cursor.result_set is None
+        assert cursor.query_id == "query-id"
+
+    async def test_executemany_cancellation_discards_partial_count(self, mock_cursor):
+        cursor = mock_cursor
+        self._set_update_counts(cursor, [2])
+        cursor._poll.side_effect = [cursor._poll.return_value, asyncio.CancelledError()]
+        with pytest.raises(asyncio.CancelledError):
+            await cursor.executemany("UPDATE t SET x=1", [{}, {}])
+        assert cursor.rowcount == -1
+        assert cursor.result_set is None
+        assert cursor.query_id == "query-id"
+        cursor._cancel = AsyncMock()
+        await cursor.cancel()
+        cursor._cancel.assert_awaited_once_with("query-id")

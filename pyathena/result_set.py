@@ -758,10 +758,9 @@ class WithResultSet:
     def __init__(self):
         super().__init__()
 
-    def _reset_state(self, *, preserve_query_id: bool = False) -> None:
+    def _reset_state(self) -> None:
         self._rowcount = -1
-        if not preserve_query_id:
-            self.query_id = None
+        self.query_id = None
         if self.result_set and not self.result_set.is_closed:
             self.result_set.close()
         self.result_set = None
@@ -1093,7 +1092,8 @@ class WithFetch(BaseCursor, CursorIterator, WithResultSet):
                 rowcount = rowcount + count if rowcount >= 0 and count >= 0 else -1
         except BaseException:
             # Keep the query ID available for diagnostics and explicit cancellation.
-            self._reset_state(preserve_query_id=True)
+            self.close()
+            self.result_set = None
             raise
         self._reset_state()
         self._rowcount = rowcount
