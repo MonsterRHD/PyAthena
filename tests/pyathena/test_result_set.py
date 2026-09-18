@@ -139,6 +139,7 @@ async def test_executemany_failure_discards_partial_count(rowcount_cursor, failu
     assert facade.rowcount == -1
     assert facade.description is None
     assert cursor.result_set is None
+    assert cursor.query_id == "query-id"
     cursor._poll.side_effect = None
     _responses(cursor, [3])
     await _invoke(rowcount_cursor, "execute", "UPDATE t SET x=1")
@@ -157,6 +158,7 @@ async def test_executemany_parameter_iteration_failure(rowcount_cursor):
         await _invoke(rowcount_cursor, "executemany", "UPDATE t SET x=1", parameters())
     assert facade.rowcount == -1
     assert cursor.result_set is None
+    assert cursor.query_id == "query-id"
 
 
 @pytest.mark.parametrize("rowcount_cursor", ["async", "adapter"], indirect=True)
@@ -168,6 +170,10 @@ async def test_executemany_cancellation_discards_partial_count(rowcount_cursor):
         await _invoke(rowcount_cursor, "executemany", "UPDATE t SET x=1", [{}, {}])
     assert facade.rowcount == -1
     assert cursor.result_set is None
+    assert cursor.query_id == "query-id"
+    cursor._cancel = AsyncMock()
+    await cursor.cancel()
+    cursor._cancel.assert_awaited_once_with("query-id")
 
 
 async def test_adapter_executemany_clears_buffered_rows():

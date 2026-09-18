@@ -758,9 +758,10 @@ class WithResultSet:
     def __init__(self):
         super().__init__()
 
-    def _reset_state(self) -> None:
+    def _reset_state(self, *, preserve_query_id: bool = False) -> None:
         self._rowcount = -1
-        self.query_id = None
+        if not preserve_query_id:
+            self.query_id = None
         if self.result_set and not self.result_set.is_closed:
             self.result_set.close()
         self.result_set = None
@@ -1086,9 +1087,11 @@ class WithFetch(BaseCursor, CursorIterator, WithResultSet):
                 self.execute(operation, parameters, **kwargs)
                 count = self.rowcount
                 rowcount = rowcount + count if rowcount >= 0 and count >= 0 else -1
-        finally:
-            # Discard result sets even if execution or parameter iteration fails.
-            self._reset_state()
+        except BaseException:
+            # Keep the query ID available for diagnostics and explicit cancellation.
+            self._reset_state(preserve_query_id=True)
+            raise
+        self._reset_state()
         self._rowcount = rowcount
 
     def cancel(self) -> None:

@@ -451,9 +451,11 @@ class WithAsyncFetch(AioBaseCursor, CursorIterator, WithResultSet):
                 await self.execute(operation, parameters, **kwargs)
                 count = self.rowcount
                 rowcount = rowcount + count if rowcount >= 0 and count >= 0 else -1
-        finally:
-            # Discard result sets even if execution or parameter iteration fails.
-            self._reset_state()
+        except BaseException:
+            # Keep the query ID available for diagnostics and explicit cancellation.
+            self._reset_state(preserve_query_id=True)
+            raise
+        self._reset_state()
         self._rowcount = rowcount
 
     async def cancel(self) -> None:
