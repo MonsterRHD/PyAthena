@@ -796,8 +796,7 @@ class TestCursor:
             "INSERT INTO execute_many (a, b) VALUES (%(a)d, %(b)s)",
             [{"a": a, "b": b} for a, b in rows],
         )
-        # rowcount is not supported for executemany
-        assert cursor.rowcount == -1
+        assert cursor.rowcount == len(rows)
         cursor.execute("SELECT * FROM execute_many")
         assert sorted(cursor.fetchall()) == list(rows)
 

@@ -276,7 +276,7 @@ class TestAioCursor:
             "INSERT INTO execute_many_aio (a, b) VALUES (%(a)d, %(b)s)",
             [{"a": a, "b": b} for a, b in rows],
         )
-        assert aio_cursor.rowcount == -1
+        assert aio_cursor.rowcount == len(rows)
         await aio_cursor.execute("SELECT * FROM execute_many_aio")
         assert sorted(await aio_cursor.fetchall()) == list(rows)
 
