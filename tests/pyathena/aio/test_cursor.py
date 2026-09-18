@@ -284,11 +284,18 @@ class TestAioCursor:
     @pytest.mark.parametrize(
         ("operation", "expected"),
         [
-            (
+            pytest.param(
+                "INSERT INTO {table} SELECT id+10, group_id+10, value "
+                "FROM {table} WHERE group_id=%(group_id)d",
+                [(1, 10), (2, 20), (3, 30), (11, 10), (12, 20), (13, 30)],
+                id="insert",
+            ),
+            pytest.param(
                 "UPDATE {table} SET value=value+1 WHERE group_id=%(group_id)d",
                 [(1, 11), (2, 21), (3, 31)],
+                id="update",
             ),
-            ("DELETE FROM {table} WHERE group_id=%(group_id)d", []),
+            pytest.param("DELETE FROM {table} WHERE group_id=%(group_id)d", [], id="delete"),
         ],
     )
     async def test_executemany_rowcount(self, aio_cursor, executemany_table, operation, expected):
