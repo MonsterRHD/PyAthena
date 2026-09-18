@@ -488,9 +488,12 @@ class TestAioCursorExecutemany:
     async def test_executemany_parameter_iteration_failure(self, mock_cursor):
         cursor = mock_cursor
         self._set_update_counts(cursor, [2])
+        previous = None
 
         def parameters():
+            nonlocal previous
             yield {}
+            previous = cursor.result_set
             raise ValueError("invalid parameters")
 
         with pytest.raises(ValueError, match="invalid parameters"):
@@ -498,6 +501,8 @@ class TestAioCursorExecutemany:
         assert cursor.rowcount == -1
         assert cursor.result_set is None
         assert cursor.query_id == "query-id"
+        assert previous is not None
+        assert previous.is_closed
 
     async def test_executemany_cancellation_discards_partial_count(self, mock_cursor):
         cursor = mock_cursor
