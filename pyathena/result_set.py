@@ -1075,6 +1075,10 @@ class WithFetch(BaseCursor, CursorIterator, WithResultSet):
         sets it to 0. On failure, it is -1; earlier executions are not rolled
         back. Result sets are discarded.
 
+        On failure, ``query_id`` retains the current query ID when available.
+        If parameter iteration fails, this can identify the last successful
+        execution.
+
         Args:
             operation: SQL query string to execute.
             seq_of_parameters: Sequence of parameter sets, one per execution.
