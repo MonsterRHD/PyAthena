@@ -1,14 +1,8 @@
-import asyncio
-from unittest.mock import AsyncMock, MagicMock
-
 import pytest
 import sqlalchemy
 from sqlalchemy import text
 from sqlalchemy.sql.schema import MetaData, Table
-from sqlalchemy.util.concurrency import greenlet_spawn
 
-from pyathena.aio.sqlalchemy.base import AsyncAdapt_pyathena_cursor
-from pyathena.error import OperationalError
 from tests import ENV
 
 
@@ -105,44 +99,45 @@ class TestAsyncSQLAlchemyAthena:
         assert not actual["autoincrement"]
         assert actual["comment"] == "some comment"
 
-
-class TestAsyncAdaptPyAthenaCursor:
-    @pytest.mark.parametrize("rowcount", [2, 0, -1])
-    async def test_executemany(self, rowcount):
-        aio_cursor = MagicMock(rowcount=rowcount, description=None)
-        aio_cursor.executemany = AsyncMock()
-        cursor = AsyncAdapt_pyathena_cursor(aio_cursor)
-        cursor._rows.append(("previous query",))
-        parameters = [{"id": 1}, {"id": 2}]
-
-        result = await greenlet_spawn(
-            cursor.executemany,
-            "UPDATE t SET x=1 WHERE id=%(id)s",
-            parameters,
-            work_group="test-workgroup",
-        )
-
-        assert result is None
-        aio_cursor.executemany.assert_awaited_once_with(
-            "UPDATE t SET x=1 WHERE id=%(id)s", parameters, work_group="test-workgroup"
-        )
-        aio_cursor.execute.assert_not_called()
-        assert cursor.rowcount == rowcount
-        assert cursor.description is None
-        assert cursor.fetchall() == []
-
     @pytest.mark.parametrize(
-        "error", [OperationalError("execution failed"), asyncio.CancelledError()]
+        ("operation", "expected"),
+        [
+            (
+                "UPDATE {table} SET value=value+1 WHERE group_id=:group_id",
+                [(1, 11), (2, 21), (3, 31)],
+            ),
+            ("DELETE FROM {table} WHERE group_id=:group_id", []),
+        ],
     )
-    async def test_executemany_failure_clears_buffered_rows(self, error):
-        aio_cursor = MagicMock()
-        aio_cursor.executemany = AsyncMock(side_effect=error)
-        cursor = AsyncAdapt_pyathena_cursor(aio_cursor)
-        cursor._rows.append(("previous query",))
+    async def test_executemany_rowcount(self, async_engine, executemany_table, operation, expected):
+        _, conn = async_engine
+        statement = text(operation.format(table=executemany_table))
+        result = await conn.execute(statement, [{"group_id": 1}, {"group_id": 2}, {"group_id": 99}])
+        assert result.rowcount == 3
+        assert not result.returns_rows
+        with pytest.raises(sqlalchemy.exc.ResourceClosedError):
+            result.fetchall()
 
-        with pytest.raises(type(error)) as caught:
-            await greenlet_spawn(cursor.executemany, "UPDATE t SET x=1", [{}])
+        result = await conn.execute(statement, [{"group_id": 99}, {"group_id": 100}])
+        assert result.rowcount == 0
+        rows = (
+            await conn.execute(text(f"SELECT id, value FROM {executemany_table} ORDER BY id"))
+        ).fetchall()
+        assert rows == expected
 
-        assert caught.value is error
-        assert cursor.fetchall() == []
-        aio_cursor.executemany.assert_awaited_once_with("UPDATE t SET x=1", [{}])
+    async def test_executemany_failure(self, async_engine, executemany_table):
+        _, conn = async_engine
+        statement = text(
+            f"UPDATE {executemany_table} SET value=value+1 "
+            "WHERE group_id=CAST(:group_id AS INTEGER)"
+        )
+        with pytest.raises(sqlalchemy.exc.OperationalError):
+            await conn.execute(
+                statement, [{"group_id": "1"}, {"group_id": "invalid"}, {"group_id": "2"}]
+            )
+        rows = (
+            await conn.execute(text(f"SELECT id, value FROM {executemany_table} ORDER BY id"))
+        ).fetchall()
+        assert rows == [(1, 11), (2, 21), (3, 30)]
+        result = await conn.execute(statement, {"group_id": "2"})
+        assert result.rowcount == 1

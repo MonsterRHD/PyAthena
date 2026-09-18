@@ -16,10 +16,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from pyathena import BINARY, BOOLEAN, DATE, DATETIME, JSON, NUMBER, STRING, TIME, ExecuteOptions
-from pyathena.converter import DefaultTypeConverter, _to_array, _to_map, _to_struct
+from pyathena.converter import _to_array, _to_map, _to_struct
 from pyathena.cursor import Cursor
 from pyathena.error import DatabaseError, NotSupportedError, OperationalError, ProgrammingError
-from pyathena.formatter import DefaultParameterFormatter
 from pyathena.model import AthenaQueryExecution
 from pyathena.util import RetryConfig
 from tests import ENV
@@ -29,34 +28,6 @@ _logger = logging.getLogger(__name__)
 
 
 class TestCursor:
-    @pytest.fixture
-    def mock_cursor(self):
-        cursor = Cursor(
-            connection=MagicMock(_client_kwargs={}),
-            converter=DefaultTypeConverter(),
-            formatter=DefaultParameterFormatter(),
-            retry_config=RetryConfig(),
-        )
-        with (
-            patch.object(cursor, "_execute", new_callable=MagicMock, return_value="query-id"),
-            patch.object(
-                cursor,
-                "_poll",
-                new_callable=MagicMock,
-                return_value=MagicMock(state="SUCCEEDED", substatement_type="UPDATE"),
-            ),
-        ):
-            yield cursor
-
-    def _set_update_counts(self, cursor, counts):
-        cursor.connection.client.get_query_results.side_effect = [
-            {
-                "ResultSet": {"ResultSetMetadata": {"ColumnInfo": []}, "Rows": []},
-                **({"UpdateCount": count} if count is not None else {}),
-            }
-            for count in counts
-        ]
-
     def test_fetchone(self, cursor):
         cursor.execute("SELECT * FROM one_row")
         assert cursor.rowcount == -1
@@ -830,114 +801,94 @@ class TestCursor:
         assert sorted(cursor.fetchall()) == list(rows)
 
     @pytest.mark.parametrize(
-        ("counts", "expected"),
+        ("operation", "expected"),
         [
-            ([1, 1, 0], 2),
-            ([0, 0], 0),
-            ([4], 4),
-            ([], 0),
-            ([1, None, 3], -1),
-            ([None, 2], -1),
-            ([1, None], -1),
+            (
+                "UPDATE {table} SET value=value+1 WHERE group_id=%(group_id)d",
+                [(1, 11), (2, 21), (3, 31)],
+            ),
+            ("DELETE FROM {table} WHERE group_id=%(group_id)d", []),
         ],
     )
-    def test_executemany_rowcount(self, mock_cursor, counts, expected):
-        cursor = mock_cursor
-        self._set_update_counts(cursor, counts)
-        parameters = [{"id": index} for index in range(len(counts))]
-        assert cursor.rowcount == -1
+    def test_executemany_rowcount(self, cursor, executemany_table, operation, expected):
+        operation = operation.format(table=executemany_table)
+        cursor.execute(f"SELECT id, value FROM {executemany_table} ORDER BY id")
+        previous = cursor.result_set
         result = cursor.executemany(
-            "UPDATE t SET x=1 WHERE id=%(id)s", parameters, work_group="test-workgroup"
+            operation,
+            [{"group_id": 1}, {"group_id": 2}, {"group_id": 99}],
+            work_group=ENV.default_work_group,
         )
         assert result is None
-        assert cursor.rowcount == expected
+        assert cursor.rowcount == 3
         assert cursor.description is None
         assert cursor.result_set is None
         assert cursor.query_id is None
-        assert cursor._execute.call_count == len(counts)
-        assert cursor.connection.client.get_query_results.call_count == len(counts)
-        for call, parameters_item in zip(cursor._execute.call_args_list, parameters, strict=True):
-            assert call.kwargs["parameters"] == parameters_item
-            assert call.kwargs["options"].work_group == "test-workgroup"
+        assert previous.is_closed
+
+        cursor.executemany(operation, [])
+        assert cursor.rowcount == 0
+        cursor.executemany(operation, [{"group_id": 99}, {"group_id": 100}])
+        assert cursor.rowcount == 0
         cursor.close()
         assert cursor.rowcount == -1
 
-    def test_executemany_replaces_previous_state(self, mock_cursor):
-        cursor = mock_cursor
-        self._set_update_counts(cursor, [5, 2, 1, 4, 0])
-        cursor.execute("UPDATE t SET x=1")
-        previous = cursor.result_set
-        cursor.executemany("UPDATE t SET x=1", [{}, {}])
-        assert previous.is_closed
-        assert cursor.rowcount == 3
-        cursor.executemany("UPDATE t SET x=1", [{}])
-        assert cursor.rowcount == 4
-        cursor.execute("UPDATE t SET x=1 WHERE id=99")
-        assert cursor.rowcount == 0
-        cursor.executemany("UPDATE t SET x=1", [])
-        assert cursor.rowcount == 0
-        assert cursor.description is None
-
-    def test_executemany_unknown_and_select_reset_previous_count(self, mock_cursor):
-        cursor = mock_cursor
-        self._set_update_counts(cursor, [7, None, 0, 0])
-        cursor.executemany("UPDATE t SET x=1", [{}])
-        assert cursor.rowcount == 7
-        cursor.execute("UPDATE t SET x=1")
+        cursor.execute(f"SELECT id, value FROM {executemany_table} ORDER BY id")
         assert cursor.rowcount == -1
-        cursor._poll.return_value.substatement_type = "SELECT"
-        cursor.execute("SELECT 1")
-        assert cursor.rowcount == -1
-        cursor.executemany("SELECT 1", [{}])
-        assert cursor.rowcount == -1
-        with pytest.raises(ProgrammingError, match="No result set"):
-            cursor.fetchone()
-        with pytest.raises(ProgrammingError, match="No result set"):
-            cursor.fetchmany()
-        with pytest.raises(ProgrammingError, match="No result set"):
-            cursor.fetchall()
+        assert cursor.fetchall() == expected
 
     @pytest.mark.parametrize("failure_index", [0, 1])
-    def test_executemany_failure_discards_partial_count(self, mock_cursor, failure_index):
-        cursor = mock_cursor
-        self._set_update_counts(cursor, [9, 2, 3])
-        cursor.executemany("UPDATE t SET x=1", [{}])
-        error = OperationalError("execution failed")
-        execution = cursor._poll.return_value
-        cursor._poll.side_effect = [execution] * failure_index + [error]
-        with pytest.raises(OperationalError, match="execution failed") as caught:
-            cursor.executemany("UPDATE t SET x=1", [{}, {}, {}])
-        assert caught.value is error
+    def test_executemany_failure(self, cursor, executemany_table, failure_index):
+        operation = (
+            f"UPDATE {executemany_table} SET value=value+1 "
+            "WHERE group_id=CAST(%(group_id)s AS INTEGER)"
+        )
+        parameters = [{"group_id": "1"}] * failure_index + [
+            {"group_id": "invalid"},
+            {"group_id": "2"},
+        ]
+        with pytest.raises(OperationalError):
+            cursor.executemany(operation, parameters)
         assert cursor.rowcount == -1
         assert cursor.description is None
         assert cursor.result_set is None
-        assert cursor.query_id == "query-id"
-        cursor._poll.side_effect = None
-        self._set_update_counts(cursor, [3])
-        cursor.execute("UPDATE t SET x=1")
-        assert cursor.rowcount == 3
+        assert cursor.query_id
 
-    def test_executemany_parameter_iteration_failure(self, mock_cursor):
-        cursor = mock_cursor
-        self._set_update_counts(cursor, [2])
+        cursor.execute(f"SELECT id, value FROM {executemany_table} ORDER BY id")
+        assert cursor.fetchall() == [(1, 10 + failure_index), (2, 20 + failure_index), (3, 30)]
+        cursor.execute(operation, {"group_id": "2"})
+        assert cursor.rowcount == 1
+
+    def test_executemany_parameter_iteration_failure(self, cursor, executemany_table):
         previous = None
+        query_id = None
 
         def parameters():
-            nonlocal previous
-            yield {}
+            nonlocal previous, query_id
+            yield {"group_id": 1}
             previous = cursor.result_set
+            query_id = cursor.query_id
             raise ValueError("invalid parameters")
 
         with pytest.raises(ValueError, match="invalid parameters"):
-            cursor.executemany("UPDATE t SET x=1", parameters())
+            cursor.executemany(
+                f"UPDATE {executemany_table} SET value=value+1 WHERE group_id=%(group_id)d",
+                parameters(),
+            )
         assert cursor.rowcount == -1
         assert cursor.result_set is None
-        assert cursor.query_id == "query-id"
+        assert query_id is not None
+        assert cursor.query_id == query_id
         assert previous is not None
         assert previous.is_closed
+        cursor.execute(f"SELECT id, value FROM {executemany_table} ORDER BY id")
+        assert cursor.fetchall() == [(1, 11), (2, 21), (3, 30)]
 
     def test_executemany_fetch(self, cursor):
+        cursor.executemany("SELECT %(x)d FROM one_row", [])
+        assert cursor.rowcount == 0
         cursor.executemany("SELECT %(x)d FROM one_row", [{"x": i} for i in range(1, 2)])
+        assert cursor.rowcount == -1
         # Operations that have result sets are not allowed with executemany.
         pytest.raises(ProgrammingError, cursor.fetchall)
         pytest.raises(ProgrammingError, cursor.fetchmany)

@@ -7,9 +7,7 @@ import pytest
 
 from pyathena import ExecuteOptions
 from pyathena.aio.cursor import AioCursor
-from pyathena.converter import DefaultTypeConverter
 from pyathena.error import DatabaseError, OperationalError, ProgrammingError
-from pyathena.formatter import DefaultParameterFormatter
 from pyathena.model import AthenaQueryExecution
 from pyathena.result_set import AthenaResultSet
 from pyathena.util import RetryConfig
@@ -18,34 +16,6 @@ from tests.pyathena.aio.conftest import _aio_connect
 
 
 class TestAioCursor:
-    @pytest.fixture
-    def mock_cursor(self):
-        cursor = AioCursor(
-            connection=MagicMock(_client_kwargs={}),
-            converter=DefaultTypeConverter(),
-            formatter=DefaultParameterFormatter(),
-            retry_config=RetryConfig(),
-        )
-        with (
-            patch.object(cursor, "_execute", new_callable=AsyncMock, return_value="query-id"),
-            patch.object(
-                cursor,
-                "_poll",
-                new_callable=AsyncMock,
-                return_value=MagicMock(state="SUCCEEDED", substatement_type="UPDATE"),
-            ),
-        ):
-            yield cursor
-
-    def _set_update_counts(self, cursor, counts):
-        cursor.connection.client.get_query_results.side_effect = [
-            {
-                "ResultSet": {"ResultSetMetadata": {"ColumnInfo": []}, "Rows": []},
-                **({"UpdateCount": count} if count is not None else {}),
-            }
-            for count in counts
-        ]
-
     async def test_fetchone(self, aio_cursor):
         await aio_cursor.execute("SELECT * FROM one_row")
         assert aio_cursor.rowcount == -1
@@ -312,127 +282,128 @@ class TestAioCursor:
         assert sorted(await aio_cursor.fetchall()) == list(rows)
 
     @pytest.mark.parametrize(
-        ("counts", "expected"),
+        ("operation", "expected"),
         [
-            ([1, 1, 0], 2),
-            ([0, 0], 0),
-            ([4], 4),
-            ([], 0),
-            ([1, None, 3], -1),
-            ([None, 2], -1),
-            ([1, None], -1),
+            (
+                "UPDATE {table} SET value=value+1 WHERE group_id=%(group_id)d",
+                [(1, 11), (2, 21), (3, 31)],
+            ),
+            ("DELETE FROM {table} WHERE group_id=%(group_id)d", []),
         ],
     )
-    async def test_executemany_rowcount(self, mock_cursor, counts, expected):
-        cursor = mock_cursor
-        self._set_update_counts(cursor, counts)
-        parameters = [{"id": index} for index in range(len(counts))]
-        assert cursor.rowcount == -1
-        result = await cursor.executemany(
-            "UPDATE t SET x=1 WHERE id=%(id)s", parameters, work_group="test-workgroup"
+    async def test_executemany_rowcount(self, aio_cursor, executemany_table, operation, expected):
+        operation = operation.format(table=executemany_table)
+        await aio_cursor.execute(f"SELECT id, value FROM {executemany_table} ORDER BY id")
+        previous = aio_cursor.result_set
+        result = await aio_cursor.executemany(
+            operation,
+            [{"group_id": 1}, {"group_id": 2}, {"group_id": 99}],
+            work_group=ENV.default_work_group,
         )
         assert result is None
-        assert cursor.rowcount == expected
-        assert cursor.description is None
-        assert cursor.result_set is None
-        assert cursor.query_id is None
-        assert cursor._execute.call_count == len(counts)
-        assert cursor.connection.client.get_query_results.call_count == len(counts)
-        for call, parameters_item in zip(cursor._execute.call_args_list, parameters, strict=True):
-            assert call.kwargs["parameters"] == parameters_item
-            assert call.kwargs["options"].work_group == "test-workgroup"
-        cursor.close()
-        assert cursor.rowcount == -1
-
-    async def test_executemany_replaces_previous_state(self, mock_cursor):
-        cursor = mock_cursor
-        self._set_update_counts(cursor, [5, 2, 1, 4, 0])
-        await cursor.execute("UPDATE t SET x=1")
-        previous = cursor.result_set
-        await cursor.executemany("UPDATE t SET x=1", [{}, {}])
+        assert aio_cursor.rowcount == 3
+        assert aio_cursor.description is None
+        assert aio_cursor.result_set is None
+        assert aio_cursor.query_id is None
         assert previous.is_closed
-        assert cursor.rowcount == 3
-        await cursor.executemany("UPDATE t SET x=1", [{}])
-        assert cursor.rowcount == 4
-        await cursor.execute("UPDATE t SET x=1 WHERE id=99")
-        assert cursor.rowcount == 0
-        await cursor.executemany("UPDATE t SET x=1", [])
-        assert cursor.rowcount == 0
-        assert cursor.description is None
 
-    async def test_executemany_unknown_and_select_reset_previous_count(self, mock_cursor):
-        cursor = mock_cursor
-        self._set_update_counts(cursor, [7, None, 0, 0])
-        await cursor.executemany("UPDATE t SET x=1", [{}])
-        assert cursor.rowcount == 7
-        await cursor.execute("UPDATE t SET x=1")
-        assert cursor.rowcount == -1
-        cursor._poll.return_value.substatement_type = "SELECT"
-        await cursor.execute("SELECT 1")
-        assert cursor.rowcount == -1
-        await cursor.executemany("SELECT 1", [{}])
-        assert cursor.rowcount == -1
-        with pytest.raises(ProgrammingError, match="No result set"):
-            await cursor.fetchone()
-        with pytest.raises(ProgrammingError, match="No result set"):
-            await cursor.fetchmany()
-        with pytest.raises(ProgrammingError, match="No result set"):
-            await cursor.fetchall()
+        await aio_cursor.executemany(operation, [])
+        assert aio_cursor.rowcount == 0
+        await aio_cursor.executemany(operation, [{"group_id": 99}, {"group_id": 100}])
+        assert aio_cursor.rowcount == 0
+        aio_cursor.close()
+        assert aio_cursor.rowcount == -1
+
+        await aio_cursor.execute(f"SELECT id, value FROM {executemany_table} ORDER BY id")
+        assert aio_cursor.rowcount == -1
+        assert await aio_cursor.fetchall() == expected
 
     @pytest.mark.parametrize("failure_index", [0, 1])
-    async def test_executemany_failure_discards_partial_count(self, mock_cursor, failure_index):
-        cursor = mock_cursor
-        self._set_update_counts(cursor, [9, 2, 3])
-        await cursor.executemany("UPDATE t SET x=1", [{}])
-        error = OperationalError("execution failed")
-        execution = cursor._poll.return_value
-        cursor._poll.side_effect = [execution] * failure_index + [error]
-        with pytest.raises(OperationalError, match="execution failed") as caught:
-            await cursor.executemany("UPDATE t SET x=1", [{}, {}, {}])
-        assert caught.value is error
-        assert cursor.rowcount == -1
-        assert cursor.description is None
-        assert cursor.result_set is None
-        assert cursor.query_id == "query-id"
-        cursor._poll.side_effect = None
-        self._set_update_counts(cursor, [3])
-        await cursor.execute("UPDATE t SET x=1")
-        assert cursor.rowcount == 3
+    async def test_executemany_failure(self, aio_cursor, executemany_table, failure_index):
+        operation = (
+            f"UPDATE {executemany_table} SET value=value+1 "
+            "WHERE group_id=CAST(%(group_id)s AS INTEGER)"
+        )
+        parameters = [{"group_id": "1"}] * failure_index + [
+            {"group_id": "invalid"},
+            {"group_id": "2"},
+        ]
+        with pytest.raises(OperationalError):
+            await aio_cursor.executemany(operation, parameters)
+        assert aio_cursor.rowcount == -1
+        assert aio_cursor.description is None
+        assert aio_cursor.result_set is None
+        assert aio_cursor.query_id
 
-    async def test_executemany_parameter_iteration_failure(self, mock_cursor):
-        cursor = mock_cursor
-        self._set_update_counts(cursor, [2])
+        await aio_cursor.execute(f"SELECT id, value FROM {executemany_table} ORDER BY id")
+        assert await aio_cursor.fetchall() == [
+            (1, 10 + failure_index),
+            (2, 20 + failure_index),
+            (3, 30),
+        ]
+        await aio_cursor.execute(operation, {"group_id": "2"})
+        assert aio_cursor.rowcount == 1
+
+    async def test_executemany_parameter_iteration_failure(self, aio_cursor, executemany_table):
         previous = None
+        query_id = None
 
         def parameters():
-            nonlocal previous
-            yield {}
-            previous = cursor.result_set
+            nonlocal previous, query_id
+            yield {"group_id": 1}
+            previous = aio_cursor.result_set
+            query_id = aio_cursor.query_id
             raise ValueError("invalid parameters")
 
         with pytest.raises(ValueError, match="invalid parameters"):
-            await cursor.executemany("UPDATE t SET x=1", parameters())
-        assert cursor.rowcount == -1
-        assert cursor.result_set is None
-        assert cursor.query_id == "query-id"
+            await aio_cursor.executemany(
+                f"UPDATE {executemany_table} SET value=value+1 WHERE group_id=%(group_id)d",
+                parameters(),
+            )
+        assert aio_cursor.rowcount == -1
+        assert aio_cursor.result_set is None
+        assert query_id is not None
+        assert aio_cursor.query_id == query_id
         assert previous is not None
         assert previous.is_closed
+        await aio_cursor.execute(f"SELECT id, value FROM {executemany_table} ORDER BY id")
+        assert await aio_cursor.fetchall() == [(1, 11), (2, 21), (3, 30)]
 
-    async def test_executemany_cancellation_discards_partial_count(self, mock_cursor):
-        cursor = mock_cursor
-        self._set_update_counts(cursor, [2])
-        cursor._poll.side_effect = [cursor._poll.return_value, asyncio.CancelledError()]
-        with pytest.raises(asyncio.CancelledError):
-            await cursor.executemany("UPDATE t SET x=1", [{}, {}])
-        assert cursor.rowcount == -1
-        assert cursor.result_set is None
-        assert cursor.query_id == "query-id"
-        cursor._cancel = AsyncMock()
-        await cursor.cancel()
-        cursor._cancel.assert_awaited_once_with("query-id")
+    @pytest.mark.parametrize("aio_cursor", [{"kill_on_interrupt": False}], indirect=True)
+    async def test_executemany_cancellation(self, aio_cursor, executemany_table):
+        query_ids = []
+
+        def on_start(query_id):
+            query_ids.append(query_id)
+            if len(query_ids) == 2:
+                task.cancel()
+
+        task = asyncio.create_task(
+            aio_cursor.executemany(
+                f"UPDATE {executemany_table} SET value=value+1 WHERE group_id=%(group_id)d",
+                [{"group_id": 1}, {"group_id": 2}, {"group_id": 99}],
+                on_start_query_execution=on_start,
+            )
+        )
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert len(query_ids) == 2
+            assert aio_cursor.rowcount == -1
+            assert aio_cursor.result_set is None
+            assert aio_cursor.query_id == query_ids[-1]
+            await aio_cursor.cancel()
+        finally:
+            # Wait for the submitted query to stop before the fixture drops its table.
+            if query_ids:
+                await aio_cursor._cancel(query_ids[-1])
+                await aio_cursor._poll(query_ids[-1])
 
     async def test_executemany_fetch(self, aio_cursor):
+        await aio_cursor.executemany("SELECT %(x)d FROM one_row", [])
+        assert aio_cursor.rowcount == 0
         await aio_cursor.executemany("SELECT %(x)d FROM one_row", [{"x": i} for i in range(1, 2)])
+        assert aio_cursor.rowcount == -1
         with pytest.raises(ProgrammingError):
             await aio_cursor.fetchall()
         with pytest.raises(ProgrammingError):
