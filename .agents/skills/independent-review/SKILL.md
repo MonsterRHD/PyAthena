@@ -13,7 +13,7 @@ Do not use an Enterprise account for this review.
 Resolve the locally configured `max` profile without committing a personal filesystem path, and verify the selected account/profile before sending review content.
 An API key or provider environment override must not silently route the review through a different account.
 When the profile uses `CLAUDE_CONFIG_DIR`, set it to the resolved `max` directory and check `claude auth status` for first-party Max authentication before launch.
-Use the Claude Code CLI directly; a Flink repository plugin is not a prerequisite.
+Use the Claude Code CLI directly; no reviewer plugin is required.
 For a Claude-authored change, use a different model or a human; a second Claude session is still self-review.
 An explicit user override takes precedence over these defaults.
 Existing authorization applies within its scope; this skill does not authorize unrelated external disclosure or contacting other people.

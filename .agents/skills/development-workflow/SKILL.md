@@ -58,8 +58,9 @@ Markdown-only changes need no live AWS tests; inspect the actual workflow path f
 ## Freeze review scope and preserve evidence
 
 For each round, obtain the PR's actual base branch and published head with `gh pr view --json baseRefName,headRefOid`.
-Fetch the relevant refs, confirm local HEAD matches the published head, and resolve their merge base once.
-Use literal full base and head SHAs in `git diff <base>..<head>` and in the record.
+Fetch the relevant refs, confirm local HEAD matches the published head, and resolve `git merge-base <head> <fetched-base-branch-tip>` once.
+In review commands and records, `<base>` means that merge-base SHA, not the current base-branch tip.
+Use literal full merge-base and head SHAs in `git diff <base>..<head>` and in the record.
 For a stacked PR, this base comes from its parent branch, not `master`.
 Inventory every changed file and the behavior, public contract, tests, and factual claims that need checking.
 
@@ -75,7 +76,8 @@ Record each round separately: perspective, full base/head SHAs, covered surfaces
 `CLEAN` means no actionable findings within the stated scope, not that unrun tests passed.
 Publish review records as inline comments on relevant diff lines through `gh api repos/OWNER/REPO/pulls/NUMBER/reviews`, using a `comments` array and an empty review body.
 Use `event: COMMENT`, not approval of your own PR, and store the JSON request in a temporary file passed with `--input`.
-For a clean round, anchor its evidence to a relevant changed line; reply to an existing finding when recording its repair.
+For a clean round, anchor its evidence to a relevant changed line.
+Record a repair in its existing thread using `POST repos/OWNER/REPO/pulls/NUMBER/comments/COMMENT_ID/replies` with a `body` field; replies do not use the review request's `comments` array.
 For a finding outside the diff, anchor to the related changed line and name the actual `file:line` in the comment; GitHub rejects line anchors outside the diff.
 If the user's review-only scope prohibits posting, keep the result in the response instead.
 
