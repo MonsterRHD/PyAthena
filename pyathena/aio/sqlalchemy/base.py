@@ -138,6 +138,10 @@ class AsyncAdapt_pyathena_connection(AdaptedConnection):
     def schema_name(self) -> str | None:
         return self._connection.schema_name  # type: ignore[no-any-return]
 
+    @property
+    def cursor_kwargs(self) -> dict[str, Any]:
+        return self._connection.cursor_kwargs  # type: ignore[no-any-return]
+
     def cursor(self) -> AsyncAdapt_pyathena_cursor:
         raw_cursor = self._connection.cursor()
         return AsyncAdapt_pyathena_cursor(raw_cursor)

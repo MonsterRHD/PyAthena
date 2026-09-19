@@ -267,8 +267,12 @@ class AthenaDialect(DefaultDialect):
     def _get_table(self, connection, table_name: str, schema: str | None = None, **kw):
         raw_connection = self._raw_connection(connection)
         schema = schema if schema else raw_connection.schema_name  # type: ignore[union-attr]
-        catalog = raw_connection.catalog_name
-        name = str(table_name).lower() if catalog.lower() == "awsdatacatalog" else str(table_name)
+        catalog = raw_connection.cursor_kwargs.get("catalog_name", raw_connection.catalog_name)
+        name = (
+            str(table_name).lower()
+            if (catalog or "").lower() == "awsdatacatalog"
+            else str(table_name)
+        )
         # Key by the metadata request, not the reflection method's arguments.
         # Listings and individual lookups share positive results in this Inspector.
         info_cache = kw.get("info_cache")
@@ -314,7 +318,7 @@ class AthenaDialect(DefaultDialect):
     def _get_tables(self, connection, schema: str | None = None, **kw):
         raw_connection = self._raw_connection(connection)
         schema = schema if schema else raw_connection.schema_name  # type: ignore[union-attr]
-        catalog = raw_connection.catalog_name
+        catalog = raw_connection.cursor_kwargs.get("catalog_name", raw_connection.catalog_name)
         info_cache = kw.get("info_cache")
         cache_key = ("pyathena_table_metadata_list", catalog, schema)
         if info_cache is not None and cache_key in info_cache:
@@ -325,9 +329,10 @@ class AthenaDialect(DefaultDialect):
             info_cache[cache_key] = tables
             for metadata in tables:
                 name = metadata.name
-                if name is not None and catalog.lower() == "awsdatacatalog":
+                if name is not None and (catalog or "").lower() == "awsdatacatalog":
                     name = name.lower()
-                info_cache[("pyathena_table_metadata", catalog, schema, name)] = metadata
+                # Preserve earlier reflection results until Inspector.clear_cache().
+                info_cache.setdefault(("pyathena_table_metadata", catalog, schema, name), metadata)
         return tables
 
     def get_schema_names(self, connection, **kw):

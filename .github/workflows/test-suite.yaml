@@ -6,6 +6,10 @@ on:
       test-type:
         required: true
         type: string
+      max-parallel:
+        description: Maximum number of Python versions tested concurrently
+        type: number
+        default: 5
 
 jobs:
   run:
@@ -29,6 +33,7 @@ jobs:
 
     strategy:
       fail-fast: false
+      max-parallel: ${{ inputs.max-parallel }}
       matrix:
         python-version: ['3.10', '3.11', '3.12', '3.13', '3.14']
 

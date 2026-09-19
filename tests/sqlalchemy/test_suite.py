@@ -116,13 +116,21 @@ class ComponentReflectionTest(_ComponentReflectionTest):
 
 class ComponentReflectionTestExtra(_ComponentReflectionTestExtra):
     @sa_testing.combinations(True, False, argnames="list_first")
-    def test_reuses_table_metadata(self, connection, metadata, list_first):
+    @sa_testing.combinations(True, False, argnames="cursor_catalog")
+    def test_reuses_table_metadata(
+        self, connection, metadata, monkeypatch, list_first, cursor_catalog
+    ):
         table = Table("listed_metadata", metadata, Column("id", Integer, comment="identifier"))
         table.create(connection)
         inspector = inspect(connection)
         raw_connection = connection.connection.driver_connection
         if connection.dialect.is_async:
             raw_connection = raw_connection.driver_connection
+        if cursor_catalog:
+            monkeypatch.setitem(
+                raw_connection.cursor_kwargs, "catalog_name", raw_connection.catalog_name
+            )
+            monkeypatch.setattr(raw_connection, "catalog_name", None)
         client = raw_connection.client
         calls = []
 
@@ -168,6 +176,25 @@ class ComponentReflectionTestExtra(_ComponentReflectionTestExtra):
                 assert "ListTableMetadata" in calls
         finally:
             client.meta.events.unregister("before-call.athena", record_call)
+
+    def test_preserves_table_metadata_until_clear_cache(self, connection, metadata):
+        table = Table("cached_metadata", metadata, Column("id", Integer))
+        table.create(connection)
+        inspector = inspect(connection)
+        assert [column["name"] for column in inspector.get_columns(table.name)] == ["id"]
+        table_name = connection.dialect.identifier_preparer.format_table(table)
+        connection.exec_driver_sql(f"ALTER TABLE {table_name} ADD COLUMNS (added string)")
+        assert [column["name"] for column in inspect(connection).get_columns(table.name)] == [
+            "id",
+            "added",
+        ]
+        assert table.name in inspector.get_table_names()
+        schema = connection.connection.schema_name
+        assert [column["name"] for column in inspector.get_columns(table.name, schema=schema)] == [
+            "id"
+        ]
+        inspector.clear_cache()
+        assert [column["name"] for column in inspector.get_columns(table.name)] == ["id", "added"]
 
     @sa_testing.combinations((String, None), (VARCHAR, 52), (CHAR, 52), argnames="type_,length")
     def test_hive_string_length_reflection(self, connection, metadata, type_, length):

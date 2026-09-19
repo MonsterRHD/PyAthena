@@ -92,11 +92,12 @@ The dialect does not cache direct `has_table()` calls without an `info_cache`.
 Table listings include column and table metadata.
 The dialect reuses these positive results within the same Inspector, so subsequent column, comment, and table-option reflection does not fetch each listed table again.
 Individual table lookups also share their metadata across these reflection methods.
-Metadata cache keys use the resolved catalog and schema, so omitting the default schema and passing its name explicitly reuse the same metadata and table listing.
+Metadata cache keys use the effective cursor catalog and resolved schema, so omitting the default schema and passing its name explicitly reuse the same metadata and table listing.
 Table-name case variants share metadata in `AwsDataCatalog`; other catalogs retain case-sensitive cache keys.
+A later listing preserves metadata already fetched for a table.
 `clear_cache()` also discards this metadata; an absent entry in a listing is not cached as proof that a table does not exist.
 
-Metadata throttling and permission errors remain errors rather than being reported as missing tables.
+Table-metadata lookups propagate throttling and permission errors rather than reporting missing tables.
 `has_table()` propagates these failures, including access denied by Lake Formation, instead of returning or caching `False`.
 Only recognized `EntityNotFoundException` responses establish absence; unrecognized metadata errors are propagated rather than guessed to mean a missing table.
 PyAthena recognizes Glue error codes in Athena's `MetadataException` service-error envelope and applies `RetryConfig.exceptions` to those codes.
