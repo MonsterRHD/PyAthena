@@ -37,7 +37,7 @@ from pyathena.sqlalchemy.types import (
     get_double_type,
 )
 from pyathena.sqlalchemy.util import _HashableDict
-from pyathena.util import _get_error_code, is_retryable_error, strtobool
+from pyathena.util import THROTTLING_ERROR_CODES, _get_error_code, strtobool
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -291,7 +291,8 @@ class AthenaDialect(DefaultDialect):
                 # GetTableMetadata limits table names to 128 characters, while
                 # Athena SQL and ListTableMetadata support longer table names.
                 if len(table_name) > 128:
-                    expression = re.escape(name)
+                    lowered = name.lower()
+                    expression = re.escape(lowered)
                     # ListTableMetadata limits its regex filter to 256 characters.
                     # Unusual catalog names can exceed that after regex escaping.
                     listed = cursor.list_table_metadata(
@@ -299,7 +300,10 @@ class AthenaDialect(DefaultDialect):
                         expression=expression if len(expression) <= 256 else None,
                         logging_=False,
                     )
-                    metadata = next((m for m in listed if m.name == name), None)
+                    metadata = next(
+                        (m for m in listed if m.name is not None and m.name.lower() == lowered),
+                        None,
+                    )
                     if metadata is None:
                         raise exc.NoSuchTableError(table_name)
                 else:
@@ -388,8 +392,10 @@ class AthenaDialect(DefaultDialect):
         except exc.NoSuchTableError:
             return False
         except pyathena.error.OperationalError as e:
-            retry_config = self._cursor_option(raw_connection, "retry_config")
-            if not is_retryable_error(e.__cause__ or e, retry_config):
+            if (
+                _get_error_code(e.__cause__ or e, unwrap_metadata=True)
+                not in THROTTLING_ERROR_CODES
+            ):
                 raise
             # The metadata API is still throttled after PyAthena's retries.
             # Existence can be answered by a query; column, comment and option
@@ -399,20 +405,23 @@ class AthenaDialect(DefaultDialect):
                 "checking existence with information_schema."
             )
             schema = schema if schema else raw_connection.schema_name  # type: ignore[union-attr]
-            return self._has_table_information_schema(connection, str(table_name), str(schema))
+            return self._has_table_information_schema(raw_connection, str(table_name), str(schema))
 
     @staticmethod
-    def _has_table_information_schema(connection: Connection, table_name: str, schema: str) -> bool:
-        # Athena resolves identifiers case-insensitively, so compare names the
-        # same way regardless of how the catalog reports them.
-        query = text(
-            "SELECT table_name FROM information_schema.tables "
-            "WHERE lower(table_schema) = :schema AND lower(table_name) = :table_name"
-        )
-        rows = connection.execute(
-            query, {"schema": schema.lower(), "table_name": table_name.lower()}
-        ).fetchall()
-        return bool(rows)
+    def _has_table_information_schema(
+        raw_connection: PoolProxiedConnection, table_name: str, schema: str
+    ) -> bool:
+        # Athena resolves identifiers case-insensitively and information_schema
+        # reports lowercase names; plain equality keeps the filter pushed down.
+        # The answer must reflect the catalog now, so query result reuse is off.
+        with raw_connection.driver_connection.cursor() as cursor:  # type: ignore[union-attr]
+            cursor.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = %(schema)s AND table_name = %(table_name)s",
+                {"schema": schema.lower(), "table_name": table_name.lower()},
+                result_reuse_enable=False,
+            )
+            return cursor.fetchone() is not None
 
     @reflection.cache
     def get_view_definition(

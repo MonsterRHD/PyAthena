@@ -22,6 +22,7 @@ _logger = logging.getLogger(__name__)
 PATTERN_OUTPUT_LOCATION: Pattern[str] = re.compile(
     r"^s3://(?P<bucket>[a-zA-Z0-9.\-_]+)/(?P<key>.+)$"
 )
+THROTTLING_ERROR_CODES: tuple[str, ...] = ("ThrottlingException", "TooManyRequestsException")
 # Athena wraps Glue errors without marking them retryable in its model.
 # Match the service error envelope, not arbitrary words in its message.
 PATTERN_METADATA_SERVICE_ERROR: Pattern[str] = re.compile(
@@ -140,10 +141,7 @@ class RetryConfig:
 
     def __init__(
         self,
-        exceptions: Iterable[str] = (
-            "ThrottlingException",
-            "TooManyRequestsException",
-        ),
+        exceptions: Iterable[str] = THROTTLING_ERROR_CODES,
         attempt: int = 7,
         multiplier: int = 1,
         max_delay: int = 100,
