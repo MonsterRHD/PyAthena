@@ -264,7 +264,47 @@ class LongNameBlowoutTest(_LongNameBlowoutTest):
 
 
 class HasTableTest(_HasTableTest):
-    @sa_testing.combinations("AccessDeniedException", "ThrottlingException", None, argnames="code")
+    @sa_testing.combinations(True, False, argnames="wrapped")
+    @sa_testing.combinations(True, False, argnames="exists")
+    def test_throttled_existence_check_uses_information_schema(
+        self, connection, metadata, monkeypatch, wrapped, exists
+    ):
+        table = Table("throttled_existence", metadata, Column("id", Integer))
+        table.create(connection)
+        raw_connection = connection.connection.driver_connection
+        if connection.dialect.is_async:
+            raw_connection = raw_connection.driver_connection
+        error = ClientError(
+            {
+                "Error": {
+                    "Code": "MetadataException" if wrapped else "ThrottlingException",
+                    "Message": "Rate exceeded (Service: AmazonDataCatalog; Status Code: 400; "
+                    "Error Code: ThrottlingException; Request ID: example; Proxy: null)"
+                    if wrapped
+                    else "Rate exceeded",
+                }
+            },
+            "GetTableMetadata",
+        )
+        calls = []
+
+        def fail_metadata(**kwargs):
+            calls.append(kwargs)
+            raise error
+
+        monkeypatch.setattr(raw_connection.client, "get_table_metadata", fail_metadata)
+        monkeypatch.setattr(raw_connection.retry_config, "attempt", 1)
+        inspector = inspect(connection)
+        name = table.name if exists else "throttled_missing"
+        assert inspector.has_table(name) is exists
+        assert inspector.has_table(name.upper(), schema=raw_connection.schema_name) is exists
+        assert len(calls) == 2
+        # Only existence falls back; reflection still reports the throttled request.
+        with pytest.raises(OperationalError) as caught:
+            inspector.get_columns(table.name)
+        assert caught.value.__cause__ is error
+
+    @sa_testing.combinations("AccessDeniedException", None, argnames="code")
     def test_metadata_errors_do_not_establish_absence(self, connection, monkeypatch, code):
         raw_connection = connection.connection.driver_connection
         if connection.dialect.is_async:

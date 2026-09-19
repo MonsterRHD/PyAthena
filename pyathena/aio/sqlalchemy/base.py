@@ -22,6 +22,7 @@ from pyathena.error import (
     ProgrammingError,
 )
 from pyathena.sqlalchemy.base import AthenaDialect
+from pyathena.util import RetryConfig
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -141,6 +142,10 @@ class AsyncAdapt_pyathena_connection(AdaptedConnection):
     @property
     def cursor_kwargs(self) -> dict[str, Any]:
         return self._connection.cursor_kwargs  # type: ignore[no-any-return]
+
+    @property
+    def retry_config(self) -> RetryConfig:
+        return self._connection.retry_config  # type: ignore[no-any-return]
 
     def cursor(self) -> AsyncAdapt_pyathena_cursor:
         raw_cursor = self._connection.cursor()

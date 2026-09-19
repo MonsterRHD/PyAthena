@@ -7,7 +7,13 @@ from re import Pattern
 from typing import Any
 
 import tenacity
-from tenacity import after_log, retry_if_exception, stop_after_attempt, wait_exponential
+from tenacity import (
+    after_log,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+    wait_random,
+)
 
 from pyathena import DataError
 
@@ -86,9 +92,11 @@ class RetryConfig:
 
     Attributes:
         exceptions: Tuple of AWS exception names to retry on.
-        attempt: Maximum number of retry attempts.
-        multiplier: Base multiplier for exponential backoff.
-        max_delay: Maximum delay between retries in seconds.
+        attempt: Maximum number of attempts, including the first call.
+        multiplier: Base multiplier for exponential backoff in seconds. Each
+            wait also adds uniform random jitter of up to one multiplier.
+        max_delay: Maximum exponential delay between retries in seconds,
+            before jitter is added.
         exponential_base: Base for exponential backoff calculation.
 
     Example:
@@ -116,6 +124,10 @@ class RetryConfig:
         original iterable do not change this configuration.
         Retries are applied to AWS API calls, not to SQL query execution.
         Query failures typically require manual intervention or query fixes.
+        With the default settings, the exponential waits between attempts sum
+        to 63 seconds plus jitter, which outlasts the metadata API throttling
+        episodes observed under concurrent reflection. SDK retries configured
+        on the boto3 client are a separate layer applied within each attempt.
         Recognized Glue error codes wrapped in Athena MetadataException are
         matched against exceptions in the same way as direct AWS error codes.
     """
@@ -126,7 +138,7 @@ class RetryConfig:
             "ThrottlingException",
             "TooManyRequestsException",
         ),
-        attempt: int = 5,
+        attempt: int = 7,
         multiplier: int = 1,
         max_delay: int = 100,
         exponential_base: int = 2,
@@ -159,6 +171,23 @@ def _get_error_code(ex: BaseException, unwrap_metadata: bool = False) -> str | N
     return code if isinstance(code, str) else None
 
 
+def is_retryable_error(ex: BaseException, config: RetryConfig) -> bool:
+    """Return whether an exception matches the retry policy's AWS error codes.
+
+    Args:
+        ex: The exception raised by an AWS API call.
+        config: RetryConfig whose ``exceptions`` list the retryable error codes.
+
+    Returns:
+        True if the direct error code, or a recognized Glue error code wrapped in
+        an Athena ``MetadataException``, is listed in ``config.exceptions``.
+    """
+    return any(
+        code is not None and code in config.exceptions
+        for code in (_get_error_code(ex), _get_error_code(ex, unwrap_metadata=True))
+    )
+
+
 def retry_api_call(
     func: Callable[..., Any],
     config: RetryConfig,
@@ -169,8 +198,8 @@ def retry_api_call(
     """Execute a function with automatic retry logic for AWS API calls.
 
     This function wraps AWS API calls with retry behavior based on the provided
-    configuration. It uses exponential backoff and only retries on specific
-    AWS exceptions that indicate transient failures.
+    configuration. It uses exponential backoff with uniform jitter and only
+    retries on specific AWS exceptions that indicate transient failures.
 
     Args:
         func: The AWS API function to call.
@@ -201,20 +230,17 @@ def retry_api_call(
         Other errors are propagated without retrying.
     """
 
-    def _is_retryable(ex: BaseException) -> bool:
-        return any(
-            code is not None and code in config.exceptions
-            for code in (_get_error_code(ex), _get_error_code(ex, unwrap_metadata=True))
-        )
-
     retry = tenacity.Retrying(
-        retry=retry_if_exception(_is_retryable),
+        retry=retry_if_exception(lambda ex: is_retryable_error(ex, config)),
         stop=stop_after_attempt(config.attempt),
+        # Uniform jitter of up to one multiplier keeps concurrent clients from
+        # retrying in lockstep after a shared throttling response.
         wait=wait_exponential(
             multiplier=config.multiplier,
             max=config.max_delay,
             exp_base=config.exponential_base,
-        ),
+        )
+        + wait_random(0, config.multiplier),
         after=after_log(logger, logger.getEffectiveLevel()) if logger else None,  # type: ignore[arg-type]
         reraise=True,
     )

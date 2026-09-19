@@ -1,10 +1,17 @@
 from typing import Any
 
 import pytest
+import tenacity.nap
 from botocore.exceptions import ClientError
 
 from pyathena import DataError
-from pyathena.util import RetryConfig, parse_output_location, retry_api_call, strtobool
+from pyathena.util import (
+    RetryConfig,
+    is_retryable_error,
+    parse_output_location,
+    retry_api_call,
+    strtobool,
+)
 
 
 def test_parse_output_location():
@@ -160,3 +167,82 @@ def test_retry_api_call_with_reusable_exception_policy(wrapped, policy_type):
 
         assert retry_api_call(call, config) == "success"
         assert calls == 3
+
+
+def _throttling_error() -> ClientError:
+    return ClientError(
+        {"Error": {"Code": "ThrottlingException", "Message": "Rate exceeded"}},
+        "GetTableMetadata",
+    )
+
+
+def test_retry_config_default_attempts():
+    assert RetryConfig().attempt == 7
+
+
+@pytest.mark.parametrize(
+    ("multiplier", "max_delay", "expected_bases"),
+    [
+        (1, 100, [1, 2, 4, 8, 16, 32]),
+        (2, 10, [2, 4, 8, 10, 10, 10]),
+        (0, 0, [0, 0, 0, 0, 0, 0]),
+    ],
+)
+def test_retry_api_call_waits_with_jitter(monkeypatch, multiplier, max_delay, expected_bases):
+    sleeps = []
+    monkeypatch.setattr(tenacity.nap.time, "sleep", sleeps.append)
+    error = _throttling_error()
+    calls = 0
+
+    def call():
+        nonlocal calls
+        calls += 1
+        raise error
+
+    config = RetryConfig(attempt=7, multiplier=multiplier, max_delay=max_delay)
+    with pytest.raises(ClientError):
+        retry_api_call(call, config)
+    assert calls == 7
+    assert len(sleeps) == len(expected_bases)
+    for waited, base in zip(sleeps, expected_bases, strict=True):
+        assert base <= waited <= base + multiplier
+
+
+def test_retry_api_call_jitter_varies(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(tenacity.nap.time, "sleep", sleeps.append)
+    error = _throttling_error()
+
+    def call():
+        raise error
+
+    config = RetryConfig(attempt=20, multiplier=1, max_delay=1)
+    with pytest.raises(ClientError):
+        retry_api_call(call, config)
+    assert all(1 <= waited <= 2 for waited in sleeps)
+    assert len(set(sleeps)) > 1
+
+
+@pytest.mark.parametrize(
+    ("code", "message", "expected"),
+    [
+        ("ThrottlingException", "Rate exceeded", True),
+        (
+            "MetadataException",
+            "Rate exceeded (Service: AmazonDataCatalog; Status Code: 400; "
+            "Error Code: ThrottlingException; Request ID: example; Proxy: null)",
+            True,
+        ),
+        (
+            "MetadataException",
+            "Not authorized (Service: AmazonDataCatalog; Status Code: 400; "
+            "Error Code: AccessDeniedException; Request ID: example; Proxy: null)",
+            False,
+        ),
+        ("MetadataException", "Table not found", False),
+    ],
+)
+def test_is_retryable_error(code, message, expected):
+    error = ClientError({"Error": {"Code": code, "Message": message}}, "GetTableMetadata")
+    assert is_retryable_error(error, RetryConfig()) is expected
+    assert is_retryable_error(ValueError("no response"), RetryConfig()) is False

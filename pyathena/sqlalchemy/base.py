@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import re
 from collections.abc import Mapping, MutableMapping
 from re import Pattern
@@ -37,7 +38,7 @@ from pyathena.sqlalchemy.types import (
     get_double_type,
 )
 from pyathena.sqlalchemy.util import _HashableDict
-from pyathena.util import _get_error_code, strtobool
+from pyathena.util import _get_error_code, is_retryable_error, strtobool
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -54,6 +55,8 @@ if TYPE_CHECKING:
         ReflectedPrimaryKeyConstraint,
     )
     from sqlalchemy.sql.schema import SchemaItem
+
+_logger = logging.getLogger(__name__)
 
 
 ischema_names: dict[str, type[Any]] = {
@@ -384,6 +387,40 @@ class AthenaDialect(DefaultDialect):
             return bool(columns)
         except exc.NoSuchTableError:
             return False
+        except pyathena.error.OperationalError as e:
+            cause = e.__cause__
+            raw_connection = self._raw_connection(connection)
+            if not (
+                isinstance(cause, botocore.exceptions.ClientError)
+                and is_retryable_error(cause, raw_connection.retry_config)  # type: ignore[union-attr]
+            ):
+                raise
+            # The metadata API is still throttled after PyAthena's retries.
+            # Existence can be answered by a query; column, comment and option
+            # reflection cannot, so only this check falls back.
+            _logger.warning(
+                f"Table metadata request for {table_name} was throttled; "
+                "checking existence with information_schema."
+            )
+            return self._has_table_information_schema(connection, table_name, schema)
+
+    def _has_table_information_schema(
+        self, connection: Connection, table_name: str, schema: str | None = None
+    ) -> bool:
+        raw_connection = self._raw_connection(connection)
+        schema = schema if schema else raw_connection.schema_name  # type: ignore[union-attr]
+        catalog = raw_connection.cursor_kwargs.get("catalog_name", raw_connection.catalog_name)
+        name = (
+            str(table_name).lower()
+            if (catalog or "").lower() == "awsdatacatalog"
+            else str(table_name)
+        )
+        query = text(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = :schema AND table_name = :table_name"
+        )
+        rows = connection.execute(query, {"schema": schema, "table_name": name}).fetchall()
+        return bool(rows)
 
     @reflection.cache
     def get_view_definition(
