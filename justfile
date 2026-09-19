@@ -94,3 +94,9 @@ _benchmark-test: _benchmark-lint
 tool:
     uv tool install ruff@{{RUFF_VERSION}}
     uv tool install tox@{{TOX_VERSION}} --with tox-uv --with tox-gh-actions
+
+# Check repository scripts without accessing AWS
+scripts: lint
+    mise exec -- shellcheck scripts/*.sh
+    mise exec -- actionlint
+    uv run --locked python -m pytest scripts/tests/ -q
