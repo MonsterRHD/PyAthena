@@ -5,11 +5,20 @@ from types import SimpleNamespace
 
 import boto3
 import pandas as pd
+import polars as pl
+import pyarrow as pa
 import pytest
 from awswrangler.athena import _read
 from botocore.client import BaseClient
 from botocore.stub import Stubber
-from pyathena_bench.adapters import Adapter, consume, consume_aio, measure_query, run_adapter
+from pyathena_bench.adapters import (
+    RESULT_SETS,
+    Adapter,
+    consume,
+    consume_aio,
+    measure_query,
+    run_adapter,
+)
 from pyathena_bench.cases import Case, matrix
 from pyathena_bench.config import Settings
 
@@ -234,3 +243,70 @@ async def test_concurrent_aio_uses_distinct_cursors(monkeypatch):
     assert result["status"] == "ok"
     assert len(result["queries"]) == 3
     assert result["loop_lag_seconds"]
+
+
+@pytest.mark.parametrize("case", matrix(Settings(), "init", "flat"), ids=lambda c: c.id)
+async def test_init_uses_real_resultset_constructors_and_validates_rows(monkeypatch, case):
+    def no_network(*args, **kwargs):
+        pytest.fail("Constructor test made an AWS request")
+
+    def prefetch(result):
+        result._metadata = (
+            {"Name": "id", "Type": "bigint", "Precision": 19, "Scale": 0, "Nullable": "UNKNOWN"},
+        )
+        result._rows.append({"id": 1} if case.family == "dict" else (1,))
+
+    monkeypatch.setattr(BaseClient, "_make_api_call", no_network)
+    monkeypatch.setattr(RESULT_SETS["cursor"], "_pre_fetch", prefetch)
+    monkeypatch.setattr(RESULT_SETS["s3fs"], "_init_csv_reader", lambda self: None)
+    monkeypatch.setattr(RESULT_SETS["pandas"], "_as_pandas", lambda self: pd.DataFrame({"id": [1]}))
+    monkeypatch.setattr(RESULT_SETS["polars"], "_as_polars", lambda self: pl.DataFrame({"id": [1]}))
+    monkeypatch.setattr(RESULT_SETS["arrow"], "_as_arrow", lambda self: pa.table({"id": [1]}))
+    session = boto3.Session(
+        aws_access_key_id="testing", aws_secret_access_key="testing", region_name="us-west-2"
+    )
+    adapter = Adapter(Settings(executor_workers=3), case, session, "scratch", "s3://out/", "temp")
+    fixture = {
+        "response": {
+            "QueryExecution": {
+                "QueryExecutionId": "q",
+                "Query": "SELECT id",
+                "Status": {"State": "SUCCEEDED"},
+                "ResultConfiguration": {"OutputLocation": "s3://out/q.csv"},
+            }
+        },
+        "unload_location": "s3://out/parquet/" if case.transport == "unload" else None,
+    }
+    result = await run_adapter(adapter, "SELECT id", 1, fixture)
+    assert result["status"] == "ok", result
+    assert result["queries"][0]["rows"] == 1
+    assert 0 <= result["queries"][0]["init_seconds"] <= result["queries"][0]["total_seconds"]
+
+
+async def test_thread_pandas_passes_reader_workers_to_real_cursor(monkeypatch):
+    captured = []
+    session = boto3.Session(
+        aws_access_key_id="testing", aws_secret_access_key="testing", region_name="us-west-2"
+    )
+    adapter = Adapter(
+        Settings(executor_workers=3),
+        Case("pandas", "thread"),
+        session,
+        "scratch",
+        "s3://out/",
+        "temp",
+    )
+    with adapter.connection() as connection:
+        cursor = adapter.cursor(connection)
+        monkeypatch.setattr(cursor, "_execute", lambda *args, **kwargs: "q")
+        monkeypatch.setattr(cursor, "_poll", lambda *args: None)
+
+        def resultset(**kwargs):
+            captured.append(kwargs["max_workers"])
+            return Rows()
+
+        monkeypatch.setattr("pyathena.pandas.async_cursor.AthenaPandasResultSet", resultset)
+        result = await measure_query(adapter, cursor, "SELECT id", 5)
+        cursor.close(wait=True)
+    assert result["status"] == "ok", result
+    assert captured == [3]

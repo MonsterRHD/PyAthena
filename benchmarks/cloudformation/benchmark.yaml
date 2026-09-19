@@ -144,7 +144,7 @@ Resources:
                 Action: [cloudformation:DescribeStacks, cloudformation:SignalResource]
                 Resource: !Ref AWS::StackId
               - Effect: Allow
-                Action: [athena:StartQueryExecution, athena:GetQueryExecution, athena:GetQueryResults,
+                Action: [athena:StartQueryExecution, athena:GetQueryExecution, athena:BatchGetQueryExecution, athena:GetQueryResults,
                          athena:StopQueryExecution, athena:ListQueryExecutions, athena:GetWorkGroup]
                 Resource: !Sub arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${WorkGroup}
               - Effect: Allow
@@ -228,6 +228,7 @@ Resources:
           trap '/opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource Instance --region ${AWS::Region}' EXIT
           curl --proto '=https' --tlsv1.2 -LsSf https://astral.sh/uv/${UvVersion}/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
           git clone https://github.com/pyathena-dev/PyAthena.git /opt/pyathena
+          git -C /opt/pyathena fetch origin ${GitCommit}
           git -C /opt/pyathena checkout --detach ${GitCommit}
           export UV_PYTHON_INSTALL_DIR=/opt/uv-python
           uv python install ${PythonVersion}

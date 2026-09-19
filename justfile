@@ -78,6 +78,9 @@ _benchmark-format:
     uvx ruff@{{RUFF_VERSION}} check --config benchmarks/pyproject.toml --select I --fix benchmarks
     uvx ruff@{{RUFF_VERSION}} format --config benchmarks/pyproject.toml benchmarks
 
+_benchmark-lock:
+    uv lock --project benchmarks
+
 _benchmark-lint:
     uvx ruff@{{RUFF_VERSION}} check --config benchmarks/pyproject.toml benchmarks
     uvx ruff@{{RUFF_VERSION}} format --check --config benchmarks/pyproject.toml benchmarks

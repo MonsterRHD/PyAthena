@@ -72,3 +72,33 @@ def test_summary_preserves_failed_warmup_and_cancellation_reasons():
     assert rows[0]["median_seconds"] is None
     assert "expected 10, got 2" in rows[0]["notes"]
     assert "Warmup: q: StopQueryExecution denied" in rows[0]["notes"]
+
+
+def test_report_exposes_client_init_and_memory_increase(tmp_path):
+    trial = {
+        "case_id": "case",
+        "scale": "small",
+        "status": "ok",
+        "queries": [
+            {
+                "total_seconds": 20,
+                "post_completion_setup_seconds": 2,
+                "consume_seconds": 3,
+                "init_seconds": 1,
+            }
+        ],
+        "successful_queries_per_second": 0.05,
+        "rss_peak_bytes": 100,
+        "rss_increase_bytes": 30,
+        "max_threads": 3,
+    }
+    (tmp_path / "trials.jsonl").write_text(json.dumps(trial) + "\n")
+    report(tmp_path)
+    row = summarize([trial])[0]
+    assert row["median_client_result_seconds"] == 5
+    assert row["median_init_seconds"] == 1
+    assert row["median_rss_increase_bytes"] == 30
+    markdown = (tmp_path / "summary.md").read_text()
+    assert "Client result (s)" in markdown
+    assert "Init (s)" in markdown
+    assert "RSS increase (B)" in markdown

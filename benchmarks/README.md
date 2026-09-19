@@ -40,6 +40,8 @@ just benchmark test
 The tests use local data, fake AWS clients, and child processes.
 They do not execute Athena queries or create AWS resources.
 `just benchmark format` formats the benchmark separately from the parent project.
+After changing dependencies, extras, or dependency groups in either `pyproject.toml`, run `just benchmark lock` and commit `benchmarks/uv.lock`.
+The benchmark lock includes metadata for its editable parent dependency; CI intentionally rejects a stale lock.
 
 Commands below run from `benchmarks/`.
 `plan` and `report` do not contact AWS.
@@ -75,6 +77,7 @@ The deployment identity needs permission to create these resources and pass the 
 Use an immutable, remotely accessible commit that contains this directory and its lockfile.
 Bootstrap checks out that commit, installs pinned uv and Python versions, and runs `uv sync --locked --no-dev`.
 It signals setup completion to CloudFormation but does not prepare data or start measurements.
+The EC2 commands use `--no-sync` to reuse this verified environment; they do not revalidate the lockfile on every invocation.
 
 From the local checkout, replace the commit below with the implementation commit:
 
@@ -103,8 +106,8 @@ sudo -iu ec2-user
 cd /opt/pyathena/benchmarks
 export AWS_DEFAULT_REGION=us-west-2
 BENCHMARK_STACK_ID=$(cat stack-id.txt)
-uv run --locked --no-sync python -m pyathena_bench preflight --stack "$BENCHMARK_STACK_ID"
-uv run --locked --no-sync python -m pyathena_bench prepare \
+uv run --no-sync python -m pyathena_bench preflight --stack "$BENCHMARK_STACK_ID"
+uv run --no-sync python -m pyathena_bench prepare \
   --stack "$BENCHMARK_STACK_ID" --manifest results/input.json --scale small
 ```
 
@@ -119,7 +122,7 @@ Each preparation needs a new manifest filename; failed preparation leaves a mani
 Start with a small, selected single-query comparison:
 
 ```bash
-uv run --locked --no-sync python -m pyathena_bench run \
+uv run --no-sync python -m pyathena_bench run \
   --manifest results/input.json --out results/single-small \
   --suite single --scale small --family cursor --transport csv
 ```
@@ -127,10 +130,10 @@ uv run --locked --no-sync python -m pyathena_bench run \
 Remove the family filter to include all families, or compare native DataFrame output:
 
 ```bash
-uv run --locked --no-sync python -m pyathena_bench run \
+uv run --no-sync python -m pyathena_bench run \
   --manifest results/input.json --out results/native-small \
   --suite single --scale small --family pandas arrow polars wrangler --output-kind native
-uv run --locked --no-sync python -m pyathena_bench run \
+uv run --no-sync python -m pyathena_bench run \
   --manifest results/input.json --out results/nested-small \
   --suite single --scale small --shape nested --output-kind native
 ```
@@ -138,16 +141,20 @@ uv run --locked --no-sync python -m pyathena_bench run \
 The concurrency suite compares ThreadPool and native asyncio APIs at 1, 10, 50, and 100 simultaneous queries by default.
 It uses a bounded matrix without the chunk-size sweep.
 Use the small snapshot first; requested concurrency does not override the account's Athena quotas.
+The default workgroup is also used by this repository's integration CI.
+Schedule measurements while CI and other Athena workloads in the account are idle; a separate workgroup alone does not isolate [account-wide quotas](https://docs.aws.amazon.com/athena/latest/ug/service-limits.html).
+An alternative existing workgroup can be selected with the CloudFormation `WorkGroup` parameter and matching configuration, without changing CI.
 Throttling, queuing, and failed queries remain visible in the output.
 Both asynchronous integrations offload blocking operations when required: ThreadPool `execute()` and result consumption use an asyncio executor, and native DataFrame accessors on Aio cursors also need offloading.
 The configured asyncio executor has 32 workers by default; the shared AsyncCursor owns a separate pool of the same size.
+The SDK connection pool accommodates both executors and the requested concurrency.
 Native libraries and S3 readers can create additional threads.
 
 ```bash
-uv run --locked --no-sync python -m pyathena_bench run \
+uv run --no-sync python -m pyathena_bench run \
   --manifest results/input.json --out results/concurrent-small \
   --suite concurrent --scale small
-uv run --locked --no-sync python -m pyathena_bench run \
+uv run --no-sync python -m pyathena_bench run \
   --manifest results/input.json --out results/init-small \
   --suite init --scale small
 ```
@@ -185,6 +192,9 @@ Athena result reuse and library query caches are disabled.
 Some cursors eagerly read data during `execute()`, while others fetch lazily.
 Consequently, `consume_seconds` alone is not a fair retrieval comparison.
 Compare end-to-end times for the same output representation, then inspect server-side statistics separately.
+The one-second polling interval can dominate small-result timings; keep it identical across cases and inspect client result time separately.
+The Markdown summary includes client result time from observed completion through consumption, initialization time, and median RSS increase.
+Client result time excludes the delay between server completion and its observation, so it is not a pure local CPU measurement or a replacement for end-to-end time.
 API row conversion and native DataFrame/Table access appear as separate cases.
 Sampled RSS can miss short peaks, and the constructor suite's RSS includes its subsequent validation read.
 If the operating system denies access to per-thread CPU times, `thread_cpu_available` is false; thread counts and RSS are still recorded.
@@ -207,9 +217,24 @@ Row-count validation detects incomplete consumption; it is not a proof that diff
 
 The parent stops a trial at the configured timeout or RSS fraction of physical RAM and attempts to cancel observed active queries.
 The suite stops at the first failed trial, including a failed warmup, so outstanding queries cannot affect later measurements.
-Inspect the recorded failure, run cleanup, and prepare a new snapshot before retrying in a new output directory.
+Inspect the recorded failure and quiesce the trial outputs with `cleanup --trials-only --execute` before retrying selected cases in a new output directory against the same manifest.
+This preserves the input snapshots and initialization fixtures, so comparisons still use identical rows.
+Retain the previous local reports before cleaning remote trial outputs.
 An external kill is reported as a worker exit, not automatically as an out-of-memory error.
 Use `cleanup` after interrupted runs to discover outstanding queries whose IDs were not returned before a worker died.
+For example, after stopping the failed process:
+
+```bash
+uv run --no-sync python -m pyathena_bench cleanup --manifest results/input.json --trials-only
+uv run --no-sync python -m pyathena_bench cleanup --manifest results/input.json --trials-only --execute
+uv run --no-sync python -m pyathena_bench run \
+  --manifest results/input.json --out results/retry-small \
+  --suite single --scale small --family pandas --api thread --output-kind native
+```
+
+There is no automatic continuation of a partially recorded trial; rerun the selected comparison with the same manifest.
+Large API row cases require many result pages (at least 10,000 pages for 10 million rows) and may exceed the default one-hour timeout.
+Choose the timeout using a smaller-scale pilot before the full run.
 Do not run two orchestrators concurrently on the same dedicated host.
 
 ## Reports and recovery
@@ -221,7 +246,7 @@ Successful measurements generate `summary.csv` and `summary.md`; failed trials a
 Regenerate reports after interruption with:
 
 ```bash
-uv run --locked --no-sync python -m pyathena_bench report results/single-small
+uv run --no-sync python -m pyathena_bench report results/single-small
 ```
 
 Report recovery ignores an incomplete final JSONL record with a warning and marks started trials without a final record as incomplete.
@@ -267,6 +292,8 @@ uv run --locked python -m pyathena_bench --profile pyathena cleanup \
 ```
 
 Cleanup checks the live stack identity, cancels and waits for matching active queries, removes run-prefixed scratch tables, aborts matching multipart uploads, and removes the run's S3 prefix.
+History discovery uses [batches of up to 50 query IDs](https://docs.aws.amazon.com/athena/latest/APIReference/API_BatchGetQueryExecution.html); completed queries need no cancellation calls.
+Unavailable recorded query metadata produces a warning and falls back to scanning live history; errors inspecting that history stop cleanup before deletion.
 The transfer copy under `reports/` remains until the final stack teardown.
 For multiple manifests, repeat cleanup for each; never clean while another process is still submitting queries.
 
@@ -289,4 +316,6 @@ CloudFormation can delete an S3 bucket only when it is empty.
 The template does not retain EBS, S3, or other benchmark resources, and it does not include an automatic bucket-emptying Lambda.
 The source table, source data, and existing workgroup are not owned by this stack and remain intact.
 The local recovered reports are the retained benchmark evidence.
-If bootstrap fails, inspect the stack events and `/var/log/cloud-init-output.log`; no benchmark data is created during bootstrap.
+If bootstrap fails, inspect the stack events; no benchmark data is created during bootstrap.
+Default rollback removes the instance and its local logs.
+For bootstrap diagnosis, deploy with `--disable-rollback`, inspect `/var/log/cloud-init-output.log` while the instance exists, and explicitly delete the failed stack afterward.

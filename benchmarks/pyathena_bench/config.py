@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import re
 import tomllib
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -91,9 +90,6 @@ class Settings:
             scales=data.get("scales", {"small": 10000}),
             **data.get("measurement", {}),
         )
-
-    def digest(self) -> str:
-        return hashlib.sha256(json.dumps(asdict(self), sort_keys=True).encode()).hexdigest()
 
 
 def select_sql(database: str, table: str, shape: str) -> str:

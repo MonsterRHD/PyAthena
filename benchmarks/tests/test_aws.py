@@ -2,6 +2,7 @@ import copy
 from types import SimpleNamespace
 
 import pytest
+from botocore.exceptions import ClientError
 from pyathena_bench.aws import cleanup, prepare, validate_inputs, validate_manifest
 from pyathena_bench.config import Settings, read_json
 
@@ -140,3 +141,132 @@ def test_cleanup_deletes_only_run_owned_tables_and_prefix(aws_metadata, monkeypa
     assert all(kwargs.get("Bucket", "temporary") == "temporary" for _, kwargs in actions)
     assert all(kwargs.get("Name") != "foreign" for _, kwargs in actions)
     assert read_json(tmp_path / "manifest.json")["cleaned"]
+
+
+@pytest.mark.parametrize("trials_only", [False, True])
+def test_cleanup_batches_history_and_can_preserve_snapshots(
+    aws_metadata, monkeypatch, tmp_path, trials_only
+):
+    actions = []
+    trial_table = f"b_{RUN}_{'b' * 32}"
+    root = f"runs/{RUN}/"
+
+    class Fake:
+        def get_paginator(self, operation):
+            def pages(**kwargs):
+                actions.append((operation, kwargs))
+                return {
+                    "list_query_executions": [{"QueryExecutionIds": [str(i) for i in range(51)]}],
+                    "get_tables": [
+                        {
+                            "TableList": [
+                                {"Name": f"b_{RUN}_small"},
+                                {"Name": trial_table},
+                                {"Name": "foreign"},
+                            ]
+                        }
+                    ],
+                    "list_multipart_uploads": [{}],
+                    "list_objects_v2": [{}],
+                }[operation]
+
+            return SimpleNamespace(paginate=pages)
+
+        def get_query_execution(self, **kwargs):
+            return {"QueryExecution": {"Status": {"State": "CANCELLED"}}}
+
+        def batch_get_query_execution(self, **kwargs):
+            query_ids = kwargs["QueryExecutionIds"]
+            actions.append(("batch", query_ids))
+            return {
+                "QueryExecutions": [
+                    {
+                        "QueryExecutionId": q,
+                        "WorkGroup": "pyathena",
+                        "Status": {"State": "RUNNING" if q in {"0", "1", "2"} else "SUCCEEDED"},
+                        "ResultConfiguration": {
+                            "OutputLocation": "s3://temporary/"
+                            + (
+                                root + "trials/t/"
+                                if q == "0"
+                                else root + "prepare/"
+                                if q == "1"
+                                else "foreign/"
+                            )
+                        },
+                    }
+                    for q in query_ids
+                ]
+            }
+
+        def delete_table(self, **kwargs):
+            actions.append(("delete_table", kwargs["Name"]))
+
+    monkeypatch.setattr("pyathena_bench.aws.client", lambda *args: Fake())
+    monkeypatch.setattr(
+        "pyathena_bench.aws.cancel_queries",
+        lambda settings, ids: actions.append(("cancel", ids)) or [],
+    )
+    data = manifest()
+    cleanup(Settings(), data, tmp_path / "manifest.json", trials_only=trials_only)
+    assert [len(value) for action, value in actions if action == "batch"] == [50, 1]
+    assert ("cancel", {"0"} if trials_only else {"0", "1"}) in actions
+    assert ("delete_table", trial_table) in actions
+    assert (("delete_table", f"b_{RUN}_small") in actions) is not trials_only
+    assert ("delete_table", "foreign") not in actions
+    assert data.get("cleaned", False) is not trials_only
+    assert all(
+        value["Prefix"] == root + ("trials/" if trials_only else "")
+        for action, value in actions
+        if action in {"list_objects_v2", "list_multipart_uploads"}
+    )
+
+
+def test_cleanup_aborts_before_deletion_if_history_batch_is_incomplete(
+    aws_metadata, monkeypatch, tmp_path
+):
+    fake = SimpleNamespace(
+        get_paginator=lambda operation: SimpleNamespace(
+            paginate=lambda **kwargs: [{"QueryExecutionIds": ["q"]}]
+        ),
+        batch_get_query_execution=lambda **kwargs: {
+            "UnprocessedQueryExecutionIds": [
+                {"QueryExecutionId": "q", "ErrorCode": "InternalServerException"}
+            ]
+        },
+    )
+    monkeypatch.setattr("pyathena_bench.aws.client", lambda *args: fake)
+    with pytest.raises(RuntimeError, match="Could not inspect query history"):
+        cleanup(Settings(), manifest(), tmp_path / "manifest.json")
+
+
+@pytest.mark.parametrize("error_code", ["InvalidRequestException", "AccessDeniedException"])
+def test_cleanup_missing_history_does_not_hide_access_errors(
+    aws_metadata, monkeypatch, tmp_path, error_code
+):
+    data = manifest()
+    data["queries"] = [{"query_id": "expired"}]
+
+    def unavailable(**kwargs):
+        raise ClientError(
+            {"Error": {"Code": error_code, "Message": "Unavailable"}}, "GetQueryExecution"
+        )
+
+    def paginator(operation):
+        if operation == "list_query_executions":
+            raise RuntimeError("live history reached")
+        pytest.fail("Deletion attempted before live history check")
+
+    monkeypatch.setattr(
+        "pyathena_bench.aws.client",
+        lambda *args: SimpleNamespace(get_query_execution=unavailable, get_paginator=paginator),
+    )
+    if error_code == "InvalidRequestException":
+        with (
+            pytest.warns(UserWarning, match="metadata unavailable"),
+            pytest.raises(RuntimeError, match="live history reached"),
+        ):
+            cleanup(Settings(), data, tmp_path / "manifest.json")
+    else:
+        with pytest.raises(ClientError, match="AccessDeniedException"):
+            cleanup(Settings(), data, tmp_path / "manifest.json")

@@ -6,11 +6,13 @@ import json
 import re
 import time
 import uuid
+import warnings
 from pathlib import Path
 from typing import Any
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import ClientError
 
 from pyathena_bench.config import Settings, identifier, select_sql, write_json
 
@@ -277,13 +279,16 @@ def cancel_queries(settings: Settings, query_ids: set[str]) -> list[str]:
     return errors
 
 
-def cleanup(settings: Settings, manifest: dict[str, Any], path: Path) -> None:
+def cleanup(
+    settings: Settings, manifest: dict[str, Any], path: Path, trials_only: bool = False
+) -> None:
     """Remove this run's data after checking the current stack identity."""
     resources = validate_manifest(settings, manifest)
     session_ = session(settings)
     bucket = resources["Bucket"]
     run_id = manifest["run_id"]
-    prefix = f"runs/{run_id}/"
+    root = f"runs/{run_id}/"
+    prefix = root + "trials/" if trials_only else root
     athena = client(session_, "athena")
     # Discover queries whose worker died before returning its query ID.
     # The query prefix is checked against live Athena output metadata.
@@ -291,23 +296,46 @@ def cleanup(settings: Settings, manifest: dict[str, Any], path: Path) -> None:
     for entry in manifest["queries"]:
         if "query_id" not in entry:
             continue
-        query = athena.get_query_execution(QueryExecutionId=entry["query_id"])["QueryExecution"]
+        try:
+            query = athena.get_query_execution(QueryExecutionId=entry["query_id"])["QueryExecution"]
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] != "InvalidRequestException":
+                raise
+            # History expires independently of S3 data. Still scan live history below.
+            warnings.warn(
+                f"Query metadata unavailable for {entry['query_id']}; checking live history",
+                stacklevel=2,
+            )
+            continue
         if query.get("WorkGroup") != settings.workgroup or not query.get(
             "ResultConfiguration", {}
-        ).get("OutputLocation", "").startswith(f"s3://{bucket}/{prefix}"):
+        ).get("OutputLocation", "").startswith(f"s3://{bucket}/{root}"):
             raise ValueError("Manifest contains a query outside this run")
-        ids.add(entry["query_id"])
+        if query["ResultConfiguration"]["OutputLocation"].startswith(
+            f"s3://{bucket}/{prefix}"
+        ) and query["Status"]["State"] in {"RUNNING", "QUEUED"}:
+            ids.add(entry["query_id"])
     for page in athena.get_paginator("list_query_executions").paginate(
         WorkGroup=settings.workgroup
     ):
-        for query_id in page["QueryExecutionIds"]:
-            query = athena.get_query_execution(QueryExecutionId=query_id)["QueryExecution"]
-            if (
-                query.get("ResultConfiguration", {})
-                .get("OutputLocation", "")
-                .startswith(f"s3://{bucket}/{prefix}")
-            ):
-                ids.add(query_id)
+        query_ids = page["QueryExecutionIds"]
+        for offset in range(0, len(query_ids), 50):
+            batch = athena.batch_get_query_execution(
+                QueryExecutionIds=query_ids[offset : offset + 50]
+            )
+            if batch.get("UnprocessedQueryExecutionIds"):
+                raise RuntimeError(
+                    f"Could not inspect query history: {batch['UnprocessedQueryExecutionIds']}"
+                )
+            for query in batch["QueryExecutions"]:
+                if (
+                    query.get("WorkGroup") == settings.workgroup
+                    and query.get("ResultConfiguration", {})
+                    .get("OutputLocation", "")
+                    .startswith(f"s3://{bucket}/{prefix}")
+                    and query["Status"]["State"] in {"RUNNING", "QUEUED"}
+                ):
+                    ids.add(query["QueryExecutionId"])
     errors = cancel_queries(settings, ids)
     if errors:
         raise RuntimeError("Could not cancel queries: " + "; ".join(errors))
@@ -321,10 +349,22 @@ def cleanup(settings: Settings, manifest: dict[str, Any], path: Path) -> None:
             time.sleep(settings.poll_interval)
     glue = client(session_, "glue")
     tables: list[str] = []
+    input_tables = {item["table"] for item in manifest["scales"].values()}
     for page in glue.get_paginator("get_tables").paginate(
         DatabaseName=resources["ScratchDatabase"]
     ):
-        tables.extend(t["Name"] for t in page["TableList"] if t["Name"].startswith(f"b_{run_id}_"))
+        tables.extend(
+            t["Name"]
+            for t in page["TableList"]
+            if t["Name"].startswith(f"b_{run_id}_")
+            and (
+                not trials_only
+                or (
+                    re.fullmatch(f"b_{run_id}_[0-9a-f]{{32}}", t["Name"])
+                    and t["Name"] not in input_tables
+                )
+            )
+        )
     for table in tables:
         glue.delete_table(DatabaseName=resources["ScratchDatabase"], Name=table)
     s3 = client(session_, "s3")
@@ -337,5 +377,6 @@ def cleanup(settings: Settings, manifest: dict[str, Any], path: Path) -> None:
             response = s3.delete_objects(Bucket=bucket, Delete={"Objects": objects})
             if response.get("Errors"):
                 raise RuntimeError(str(response["Errors"]))
-    manifest["cleaned"] = True
+    if not trials_only:
+        manifest["cleaned"] = True
     write_json(path, manifest)

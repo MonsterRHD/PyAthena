@@ -161,7 +161,9 @@ class Adapter:
             poll_interval=self.settings.poll_interval,
             result_reuse_enable=False,
             config=Config(
-                max_pool_connections=max(10, self.settings.executor_workers),
+                max_pool_connections=max(
+                    10, 2 * self.settings.executor_workers, self.case.concurrency
+                ),
                 connect_timeout=10,
                 read_timeout=60,
             ),
@@ -242,8 +244,14 @@ async def measure_query(adapter: Adapter, cursor: Any, sql: str, expected: int) 
             count = consume(result, case)
             query_id = None  # The botocore observer captures IDs even for iterators.
         elif case.api == "thread":
+            # AsyncPandasCursor forwards result-reader options through execute().
+            options = (
+                {"max_workers": adapter.settings.executor_workers}
+                if case.family == "pandas"
+                else {}
+            )
             query_id, future = await asyncio.to_thread(
-                cursor.execute, sql, cache_size=0, result_reuse_enable=False
+                cursor.execute, sql, cache_size=0, result_reuse_enable=False, **options
             )
             result = await asyncio.wrap_future(future)
             ready = time.perf_counter()

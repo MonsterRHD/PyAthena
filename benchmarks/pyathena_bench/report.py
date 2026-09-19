@@ -33,6 +33,12 @@ def summarize(trials: list[dict[str, Any]]) -> list[dict[str, Any]]:
         init = [
             q["init_seconds"] for t in good for q in t.get("queries", []) if "init_seconds" in q
         ]
+        retrieval = [
+            q["post_completion_setup_seconds"] + q["consume_seconds"]
+            for t in good
+            for q in t.get("queries", [])
+            if "post_completion_setup_seconds" in q and "consume_seconds" in q
+        ]
         lag = [v for t in good for v in (t.get("loop_lag_seconds") or [])]
         phases = {}
         for key in ("execute_seconds", "consume_seconds", "post_completion_setup_seconds"):
@@ -82,6 +88,7 @@ def summarize(trials: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "median_seconds": percentile(latency, 0.5),
                 "p95_seconds": percentile(latency, 0.95),
                 "median_init_seconds": percentile(init, 0.5),
+                "median_client_result_seconds": percentile(retrieval, 0.5),
                 **phases,
                 "median_queries_per_second": statistics.median(
                     [t["successful_queries_per_second"] for t in good]
@@ -89,6 +96,14 @@ def summarize(trials: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 if good
                 else None,
                 "peak_rss_bytes": max((t["rss_peak_bytes"] for t in good), default=None),
+                "median_rss_increase_bytes": percentile(
+                    [
+                        t["rss_increase_bytes"]
+                        for t in good
+                        if t.get("rss_increase_bytes") is not None
+                    ],
+                    0.5,
+                ),
                 "loop_lag_p95_seconds": percentile(lag, 0.95),
                 "loop_lag_max_seconds": max(lag, default=None),
                 "peak_threads": max((t["max_threads"] for t in good), default=None),
@@ -135,10 +150,13 @@ def report(directory: Path) -> None:
         "Only successful measured trials contribute to timing summaries; warmups are excluded.",
         "Compare cases with the same scale, shape, output representation, and transport.",
         "Initialization timings include I/O; RSS covers construction and validation.",
+        "Client result time starts at observed Athena completion and excludes polling latency.",
+        "Total time includes Athena execution and polling; init time excludes validation.",
         "Thread counts include SDK and native library threads, not just executor workers.",
         "",
-        "| Scale | Case | OK | Fail | Warmup fail | Unsupported | Median (s) | RSS (B) | Notes |",
-        "| --- | --- | ---: | ---: | ---: | --- | ---: | ---: | --- |",
+        "| Scale | Case | OK | Fail | Warmup fail | Unsupported | Total (s) | "
+        "Client result (s) | Init (s) | Peak RSS (B) | RSS increase (B) | Notes |",
+        "| --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
     for row in rows:
         values = [
@@ -151,7 +169,10 @@ def report(directory: Path) -> None:
                 "failed_warmups",
                 "unsupported",
                 "median_seconds",
+                "median_client_result_seconds",
+                "median_init_seconds",
                 "peak_rss_bytes",
+                "median_rss_increase_bytes",
                 "notes",
             )
         ]

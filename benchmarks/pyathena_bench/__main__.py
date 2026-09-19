@@ -54,6 +54,11 @@ def parser() -> argparse.ArgumentParser:
     )
     clean.add_argument("--manifest", type=Path, required=True)
     clean.add_argument("--execute", action="store_true")
+    clean.add_argument(
+        "--trials-only",
+        action="store_true",
+        help="Keep fixed inputs and initialization fixtures for retry",
+    )
     return root
 
 
@@ -80,15 +85,21 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "stack": resources["StackId"],
                     "database": resources["ScratchDatabase"],
-                    "table_prefix": f"b_{manifest['run_id']}_",
-                    "s3_prefix": f"s3://{resources['Bucket']}/runs/{manifest['run_id']}/",
+                    "table_selector": (
+                        f"b_{manifest['run_id']}_<32-hex-trial-id> (excluding input tables)"
+                        if args.trials_only
+                        else f"b_{manifest['run_id']}_*"
+                    ),
+                    "s3_prefix": f"s3://{resources['Bucket']}/runs/{manifest['run_id']}/"
+                    + ("trials/" if args.trials_only else ""),
+                    "preserve_inputs_and_fixtures": args.trials_only,
                 },
                 indent=2,
             )
             + "\n"
         )
         if args.execute:
-            cleanup(settings, manifest, args.manifest)
+            cleanup(settings, manifest, args.manifest, trials_only=args.trials_only)
     else:
         cases = matrix(settings, args.suite, args.shape)
         cases = [
@@ -110,6 +121,15 @@ def main(argv: list[str] | None = None) -> int:
                         * len(scales)
                         * (settings.warmups + settings.repetitions),
                         "cases": [{"id": c.id, **asdict(c)} for c in cases],
+                        "warnings": [
+                            f"{scale}: row APIs need >= {(settings.scales[scale] + 999) // 1000} "
+                            "GetQueryResults pages per query; use a pilot to choose timeout_seconds"
+                            for scale in scales
+                            if settings.scales[scale] >= 1_000_000
+                            and any(
+                                c.family in {"cursor", "dict"} and c.suite != "init" for c in cases
+                            )
+                        ],
                     },
                     indent=2,
                 )
