@@ -9,6 +9,7 @@ Measurements and cursor recommendations for this harness are pending.
 The supplied input is `pyathena_benchmark.pypi_file_downloads`, with the Hive partition `download_date='2026-09-17'` (UTC).
 The source contains 4,773,620,317 rows, approximately 30.4 GiB of Parquet compressed with Snappy.
 The default region and existing Athena workgroup are `us-west-2` and `pyathena`.
+See [the dataset reference](DATASET.md) for the full source DDL, nested column definitions, timestamp representation, export/transfer procedure, validation results, and measurement-table layout.
 
 `prepare` creates one fixed Parquet/Snappy snapshot per selected scale in the stack's scratch database and bucket.
 Defaults are 10,000, 100,000, 1,000,000, and 10,000,000 rows.
