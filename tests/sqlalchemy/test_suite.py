@@ -1,7 +1,21 @@
 import logging
+from datetime import date
+from datetime import datetime as _datetime
+from decimal import Decimal
 
 import pytest
-from sqlalchemy import CHAR, VARCHAR, Integer, String, func, inspect, select
+from sqlalchemy import (
+    CHAR,
+    VARCHAR,
+    Integer,
+    MetaData,
+    String,
+    func,
+    inspect,
+    literal,
+    select,
+    types,
+)
 from sqlalchemy import exc as sa_exc
 from sqlalchemy import testing as sa_testing
 from sqlalchemy.sql.elements import quoted_name
@@ -19,6 +33,8 @@ from sqlalchemy.testing.suite import QuotedNameArgumentTest as _QuotedNameArgume
 from sqlalchemy.testing.suite import SimpleUpdateDeleteTest as _SimpleUpdateDeleteTest
 from sqlalchemy.testing.suite import StringTest as _StringTest
 
+from pyathena.sqlalchemy.types import AthenaArray, AthenaMap, AthenaStruct
+
 del BinaryTest  # noqa: F821
 del CompositeKeyReflectionTest  # noqa: F821
 del CTETest  # noqa: F821
@@ -32,6 +48,93 @@ del TimeMicrosecondsTest  # noqa: F821
 del TimeTest  # noqa: F821
 del TimestampMicrosecondsTest  # noqa: F821
 del UuidTest  # noqa: F821
+
+
+class NativeArrayTest(fixtures.TestBase):
+    __backend__ = True
+    __requires__ = ("array_type",)
+
+    def test_reflection_and_executemany(self, connection, metadata):
+        table = Table(
+            "native_array_values",
+            metadata,
+            Column("id", Integer),
+            Column("numbers", types.ARRAY(Integer)),
+            Column("labels", types.ARRAY(String, dimensions=2)),
+            Column("amounts", AthenaArray(types.Numeric(30, 20))),
+        )
+        table.create(connection)
+        values = [
+            {
+                "id": 1,
+                "numbers": [1, None, 3],
+                "labels": [["001", "null", "a,b", ""], ["thr'ee", "réve🐍 illé"]],
+                "amounts": [Decimal("0.12345678901234567890")],
+            },
+            {"id": 2, "numbers": [], "labels": [[], None], "amounts": []},
+            {"id": 3, "numbers": None, "labels": None, "amounts": None},
+        ]
+        connection.execute(table.insert(), values)
+        reflected = Table(table.name, MetaData(), autoload_with=connection)
+        assert isinstance(reflected.c.numbers.type, types.ARRAY)
+        assert isinstance(reflected.c.numbers.type.item_type, types.Integer)
+        assert isinstance(reflected.c.labels.type.item_type, types.ARRAY)
+        assert reflected.c.amounts.type.item_type.precision == 30
+        assert reflected.c.amounts.type.item_type.scale == 20
+        for source in (table, reflected):
+            rows = connection.execute(select(source).order_by(source.c.id)).mappings().all()
+            eq_([dict(row) for row in rows], values)
+        result = connection.execute(select(table.c.labels).where(table.c.id == 1))
+        cursor = getattr(result.context.cursor, "_cursor", result.context.cursor)
+        assert cursor.effective_engine_version == "Athena engine version 3"
+
+    @sa_testing.combinations(False, True, argnames="literal_execute")
+    def test_typed_scalar_and_complex_elements(self, connection, literal_execute):
+        cases = [
+            (AthenaArray(String), ["100%", "%(param_1)s", "back\\slash", "line\nbreak", "null"]),
+            (AthenaArray(types.Boolean), [True, False, None]),
+            (AthenaArray(types.Date), [date(2025, 1, 2), None]),
+            (AthenaArray(types.DateTime), [_datetime(2025, 1, 2, 3, 4, 5, 123000)]),
+            (AthenaArray(types.BINARY), [b"\x00\xff", b"", None]),
+            (AthenaArray(AthenaMap(Integer, String)), [{1: "001", 2: "a,b"}, {}, None]),
+            (
+                AthenaArray(AthenaStruct(("name", String), ("n", Integer))),
+                [{"name": "a,b", "n": 2}, None],
+            ),
+            (AthenaArray(Integer, as_tuple=True), (1, None, 3)),
+            (AthenaArray(types.JSON), [{"n": 1, "s": "a,b"}, [1, None], None]),
+        ]
+        expressions = [
+            literal(value, type_=type_, literal_execute=literal_execute).label(f"v{index}")
+            for index, (type_, value) in enumerate(cases)
+        ]
+        row = connection.execute(select(*expressions)).one()
+        eq_(tuple(row), tuple(value for _, value in cases))
+
+    def test_nested_complex_reflection(self, connection, metadata):
+        table = Table(
+            "native_array_complex",
+            metadata,
+            Column(
+                "value",
+                AthenaArray(
+                    AthenaStruct(
+                        ("label", String),
+                        ("numbers", AthenaArray(Integer)),
+                        ("amount", types.Numeric(12, 3)),
+                    )
+                ),
+            ),
+        )
+        table.create(connection)
+        value = [{"label": "001,a", "numbers": [1, None], "amount": Decimal("12.340")}]
+        connection.execute(table.insert().values(value=value))
+        reflected = Table(table.name, MetaData(), autoload_with=connection)
+        item = reflected.c.value.type.item_type
+        assert isinstance(item, AthenaStruct)
+        assert isinstance(item.fields["numbers"], types.ARRAY)
+        assert item.fields["amount"].scale == 3
+        eq_(connection.execute(select(reflected.c.value)).scalar_one(), value)
 
 
 class SimpleUpdateDeleteTest(_SimpleUpdateDeleteTest):

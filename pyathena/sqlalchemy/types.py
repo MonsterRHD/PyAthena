@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from datetime import date, datetime
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import types
+from sqlalchemy import cast, exc, types
 from sqlalchemy.sql import sqltypes
+from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.sql.type_api import TypeEngine
+from sqlalchemy.sql.visitors import InternalTraversal
+
+from pyathena.formatter import _ComplexParameter
 
 if TYPE_CHECKING:
     from sqlalchemy import Dialect
@@ -160,6 +167,13 @@ class AthenaStruct(TypeEngine[dict[str, Any]]):
         return self.fields[key]
 
     @property
+    def _static_cache_key(self):
+        return (
+            type(self),
+            tuple((name, type_._static_cache_key) for name, type_ in self.fields.items()),
+        )
+
+    @property
     def python_type(self) -> type:
         return dict
 
@@ -223,13 +237,16 @@ class MAP(AthenaMap):
     __visit_name__ = "MAP"
 
 
-class AthenaArray(TypeEngine[list[Any]]):
+class AthenaArray(sqltypes.ARRAY[Any]):
     """SQLAlchemy type for Athena ARRAY complex type.
 
     ARRAY represents an ordered collection of elements of the same type.
 
     Args:
         item_type: SQLAlchemy type for array elements. Defaults to String.
+        as_tuple: Return tuples instead of lists. Defaults to False.
+        dimensions: Fixed number of array dimensions. Defaults to one dimension.
+        zero_indexes: Translate zero-based SQLAlchemy indexes to one-based SQL indexes.
 
     Example:
         >>> from sqlalchemy import Column, Table, MetaData, types
@@ -246,21 +263,207 @@ class AthenaArray(TypeEngine[list[Any]]):
 
     __visit_name__ = "array"
 
-    def __init__(self, item_type: Any = None) -> None:
-        if item_type is None:
-            self.item_type: TypeEngine[Any] = sqltypes.String()
-        elif isinstance(item_type, TypeEngine):
+    def __init__(
+        self,
+        item_type: Any = None,
+        as_tuple: bool = False,
+        dimensions: int | None = None,
+        zero_indexes: bool = False,
+    ) -> None:
+        if dimensions is not None and (
+            isinstance(dimensions, bool) or not isinstance(dimensions, int) or dimensions < 1
+        ):
+            raise ValueError("ARRAY dimensions must be a positive integer.")
+        item_type = item_type() if isinstance(item_type, type) else item_type
+        if isinstance(item_type, sqltypes.ARRAY):
+            if dimensions is not None:
+                raise ValueError("Use either nested ARRAY types or dimensions, not both.")
+            # Preserve the public nested AthenaArray constructor and item_type.
+            super().__init__(sqltypes.String(), as_tuple, dimensions, zero_indexes)
             self.item_type = item_type
         else:
-            # Assume it's a SQLAlchemy type class and instantiate it
-            self.item_type = item_type()
+            super().__init__(item_type or sqltypes.String(), as_tuple, dimensions, zero_indexes)
 
-    @property
-    def python_type(self) -> type:
-        return list
+    def bind_expression(self, bindvalue):
+        """Cast a bound ARRAY value to its declared Athena element type."""
+        # The cast also gives empty arrays and NULL-only arrays their element type.
+        return cast(bindvalue, self)
+
+    def bind_processor(self, dialect):
+        """Return a processor that marks native ARRAY, MAP, and ROW parameters."""
+
+        def process(value):
+            return _bind_complex(value, self, dialect)
+
+        return process
+
+    def literal_processor(self, dialect):
+        """Return a processor that renders typed Athena array literals."""
+
+        def process(value):
+            return _literal_complex(value, self, dialect)
+
+        return process
+
+    def column_expression(self, colexpr):
+        """Serialize an outer result column without changing its native SQL type."""
+        return _ArrayResult(colexpr, self)
+
+    def result_processor(self, dialect, coltype):
+        """Return a processor that restores the declared Python element types."""
+
+        def process(value):
+            if value is None:
+                return None
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value, parse_float=Decimal)
+                except json.JSONDecodeError:
+                    # Textual SQL does not receive column_expression. Preserve the
+                    # DBAPI's raw fallback when native nested data is ambiguous.
+                    return value
+            return _decode_complex(value, self, self.as_tuple)
+
+        return process
 
 
 class ARRAY(AthenaArray):
     """Uppercase alias for AthenaArray type."""
 
     __visit_name__ = "ARRAY"
+
+
+class _ArrayResult(ColumnElement[Any]):
+    """Apply lossless transport only to the outermost typed result column."""
+
+    __visit_name__ = "athena_array_result"
+    inherit_cache = True
+    _traverse_internals = [  # noqa: RUF012
+        ("element", InternalTraversal.dp_clauseelement),
+        ("type", InternalTraversal.dp_type),
+    ]
+
+    def __init__(self, element, type_):
+        self.element = element
+        self.type = type_
+
+
+def _array_item_type(type_: sqltypes.ARRAY[Any]) -> TypeEngine[Any]:
+    if type_.dimensions is not None and type_.dimensions > 1:
+        return AthenaArray(
+            type_.item_type,
+            as_tuple=type_.as_tuple,
+            dimensions=type_.dimensions - 1,
+            zero_indexes=type_.zero_indexes,
+        )
+    return type_.item_type
+
+
+def _complex_values(value: Any, type_: TypeEngine[Any]):
+    if isinstance(type_, sqltypes.ARRAY):
+        if not isinstance(value, (list, tuple)):
+            raise TypeError("ARRAY values must be lists or tuples.")
+        return "ARRAY", [(item, _array_item_type(type_)) for item in value]
+    if isinstance(type_, AthenaMap):
+        if not isinstance(value, Mapping):
+            raise TypeError("MAP values must be mappings.")
+        return "MAP", [
+            (list(value), AthenaArray(type_.key_type)),
+            (list(value.values()), AthenaArray(type_.value_type)),
+        ]
+    if isinstance(type_, AthenaStruct):
+        if isinstance(value, Mapping):
+            if set(value) != set(type_.fields):
+                raise ValueError("ROW value fields must match the declared fields.")
+            values = [value[name] for name in type_.fields]
+        elif isinstance(value, (list, tuple)) and len(value) == len(type_.fields):
+            values = list(value)
+        else:
+            raise TypeError("ROW values must match the declared fields.")
+        return "ROW", list(zip(values, type_.fields.values(), strict=True))
+    return None
+
+
+def _bind_complex(value: Any, type_: TypeEngine[Any], dialect: Any) -> Any:
+    if value is None:
+        return None
+    complex_values = _complex_values(value, type_)
+    if complex_values is not None:
+        constructor, items = complex_values
+        return _ComplexParameter(
+            constructor, tuple(_bind_complex(item, item_type, dialect) for item, item_type in items)
+        )
+    if isinstance(type_, types.JSON):
+        serializer = dialect._json_serializer or json.dumps
+        return _ComplexParameter("JSON_PARSE", (serializer(value),))
+    if isinstance(value, (list, tuple, Mapping)):
+        raise TypeError("ARRAY element shape does not match its declared type.")
+    if isinstance(type_, (types.LargeBinary, types.BINARY, types.VARBINARY)):
+        return bytes(value)
+    processor = type_.dialect_impl(dialect).bind_processor(dialect)
+    return processor(value) if processor else value
+
+
+def _literal_complex(value: Any, type_: TypeEngine[Any], dialect: Any) -> str:
+    if value is None:
+        return "NULL"
+    complex_values = _complex_values(value, type_)
+    if complex_values is not None:
+        constructor, items = complex_values
+        opening, closing = ("[", "]") if constructor == "ARRAY" else ("(", ")")
+        values = ", ".join(_literal_complex(item, item_type, dialect) for item, item_type in items)
+        return f"{constructor}{opening}{values}{closing}"
+    if isinstance(type_, types.JSON):
+        serializer = dialect._json_serializer or json.dumps
+        processor = types.String().literal_processor(dialect)
+        return f"JSON_PARSE({processor(serializer(value))})"
+    if isinstance(value, (list, tuple, Mapping)):
+        raise TypeError("ARRAY element shape does not match its declared type.")
+    if isinstance(type_, (types.LargeBinary, types.BINARY, types.VARBINARY)):
+        return f"X'{bytes(value).hex()}'"
+    if isinstance(type_, types.DateTime) and isinstance(value, datetime):
+        return AthenaTimestamp.process(value)
+    if isinstance(type_, types.Date) and isinstance(value, date):
+        return AthenaDate.process(value)
+    processor = type_.dialect_impl(dialect).literal_processor(dialect)
+    if processor is None:
+        raise exc.CompileError(f"No ARRAY element literal processor for {type_!r}.")
+    return str(processor(value))
+
+
+def _decode_complex(value: Any, type_: TypeEngine[Any], as_tuple: bool = False) -> Any:
+    if value is None:
+        return None
+    if isinstance(type_, sqltypes.ARRAY):
+        items = [_decode_complex(item, _array_item_type(type_), as_tuple) for item in value]
+        return tuple(items) if as_tuple else items
+    if isinstance(type_, AthenaMap):
+        map_items = value.items() if isinstance(value, dict) else value
+        return {
+            _decode_complex(key, type_.key_type): _decode_complex(item, type_.value_type, as_tuple)
+            for key, item in map_items
+        }
+    if isinstance(type_, AthenaStruct):
+        if not type_.fields:
+            return value
+        return {
+            name: _decode_complex(value[name], field_type, as_tuple)
+            for name, field_type in type_.fields.items()
+        }
+    if isinstance(type_, types.JSON):
+        return value
+    if isinstance(type_, types.Boolean):
+        return value if isinstance(value, bool) else value.lower() == "true"
+    if isinstance(type_, types.Integer):
+        return int(value)
+    if isinstance(type_, types.Numeric):
+        return Decimal(value) if type_.asdecimal else float(value)
+    if isinstance(type_, types.DateTime):
+        return value if isinstance(value, datetime) else datetime.fromisoformat(value)
+    if isinstance(type_, types.Date):
+        return value if isinstance(value, date) else date.fromisoformat(value)
+    if isinstance(type_, (types.LargeBinary, types.BINARY, types.VARBINARY)):
+        return value if isinstance(value, bytes) else bytes.fromhex(value)
+    if isinstance(type_, types.String):
+        return str(value)
+    return value
