@@ -307,7 +307,7 @@ class AthenaArray(sqltypes.ARRAY[Any]):
 
     def column_expression(self, colexpr):
         """Serialize an outer result column without changing its native SQL type."""
-        return _ArrayResult(colexpr, self)
+        return colexpr if _has_unknown_array_element(self) else _ArrayResult(colexpr, self)
 
     def result_processor(self, dialect, coltype):
         """Return a processor that restores the declared Python element types."""
@@ -386,7 +386,29 @@ def _complex_values(value: Any, type_: TypeEngine[Any]):
     return None
 
 
+def _decorator_impl(type_: types.TypeDecorator[Any], dialect: Any) -> TypeEngine[Any]:
+    if dialect.name in type_._variant_mapping:
+        return type_._variant_mapping[dialect.name]
+    return type_.load_dialect_impl(dialect)
+
+
+def _has_unknown_array_element(type_: TypeEngine[Any]) -> bool:
+    if isinstance(type_, sqltypes.ARRAY):
+        return _has_unknown_array_element(type_.item_type)
+    if isinstance(type_, AthenaMap):
+        return _has_unknown_array_element(type_.key_type) or _has_unknown_array_element(
+            type_.value_type
+        )
+    if isinstance(type_, AthenaStruct):
+        return any(_has_unknown_array_element(field) for field in type_.fields.values())
+    return isinstance(type_, types.NullType)
+
+
 def _bind_complex(value: Any, type_: TypeEngine[Any], dialect: Any) -> Any:
+    if isinstance(type_, types.TypeDecorator):
+        if dialect.name not in type_._variant_mapping and type_._has_bind_processor:
+            value = type_.process_bind_param(value, dialect)
+        return _bind_complex(value, _decorator_impl(type_, dialect), dialect)
     if value is None:
         return None
     complex_values = _complex_values(value, type_)
@@ -402,11 +424,20 @@ def _bind_complex(value: Any, type_: TypeEngine[Any], dialect: Any) -> Any:
         raise TypeError("ARRAY element shape does not match its declared type.")
     if isinstance(type_, (types.LargeBinary, types.BINARY, types.VARBINARY)):
         return bytes(value)
+    if isinstance(type_, (types.Date, types.DateTime)):
+        return value
     processor = type_.dialect_impl(dialect).bind_processor(dialect)
     return processor(value) if processor else value
 
 
 def _literal_complex(value: Any, type_: TypeEngine[Any], dialect: Any) -> str:
+    if isinstance(type_, types.TypeDecorator):
+        if dialect.name not in type_._variant_mapping:
+            if type_._has_literal_processor:
+                value = type_.process_literal_param(value, dialect)
+            elif type_._has_bind_processor:
+                value = type_.process_bind_param(value, dialect)
+        return _literal_complex(value, _decorator_impl(type_, dialect), dialect)
     if value is None:
         return "NULL"
     complex_values = _complex_values(value, type_)
@@ -436,15 +467,13 @@ def _literal_complex(value: Any, type_: TypeEngine[Any], dialect: Any) -> str:
 def _decode_complex(
     value: Any, type_: TypeEngine[Any], as_tuple: bool = False, dialect: Any = None
 ) -> Any:
+    if isinstance(type_, types.TypeDecorator):
+        value = _decode_complex(value, _decorator_impl(type_, dialect), as_tuple, dialect)
+        if dialect.name not in type_._variant_mapping and type_._has_result_processor:
+            return type_.process_result_value(value, dialect)
+        return value
     if value is None:
         return None
-    if isinstance(type_, types.TypeDecorator):
-        implementation = type_.dialect_impl(dialect)
-        assert isinstance(implementation, types.TypeDecorator)
-        value = _decode_complex(value, implementation.impl_instance, as_tuple, dialect)
-        if implementation._has_result_processor:
-            return implementation.process_result_value(value, dialect)
-        return value
     if isinstance(type_, sqltypes.ARRAY):
         items = [
             _decode_complex(item, _array_item_type(type_), as_tuple, dialect) for item in value
