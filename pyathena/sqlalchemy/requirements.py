@@ -82,7 +82,8 @@ class Requirements(SuiteRequirements):
 
     @property
     def update_where_target_in_subquery(self):
-        return unsupported()
+        # Verified with Iceberg tables on Athena engine version 3.
+        return supported()
 
     @property
     def recursive_fk_cascade(self):

@@ -1,11 +1,11 @@
 import logging
 
 import pytest
-from sqlalchemy import CHAR, VARCHAR, Integer, String, inspect, select
+from sqlalchemy import CHAR, VARCHAR, Integer, String, func, inspect, select
 from sqlalchemy import exc as sa_exc
 from sqlalchemy import testing as sa_testing
 from sqlalchemy.sql.elements import quoted_name
-from sqlalchemy.testing import fixtures
+from sqlalchemy.testing import eq_, fixtures
 from sqlalchemy.testing.schema import Column, Table
 from sqlalchemy.testing.suite import *  # noqa: F403
 from sqlalchemy.testing.suite import ComponentReflectionTest as _ComponentReflectionTest
@@ -16,6 +16,7 @@ from sqlalchemy.testing.suite import InsertBehaviorTest as _InsertBehaviorTest
 from sqlalchemy.testing.suite import IntegerTest as _IntegerTest
 from sqlalchemy.testing.suite import LongNameBlowoutTest as _LongNameBlowoutTest
 from sqlalchemy.testing.suite import QuotedNameArgumentTest as _QuotedNameArgumentTest
+from sqlalchemy.testing.suite import SimpleUpdateDeleteTest as _SimpleUpdateDeleteTest
 from sqlalchemy.testing.suite import StringTest as _StringTest
 
 del BinaryTest  # noqa: F821
@@ -31,6 +32,33 @@ del TimeMicrosecondsTest  # noqa: F821
 del TimeTest  # noqa: F821
 del TimestampMicrosecondsTest  # noqa: F821
 del UuidTest  # noqa: F821
+
+
+class SimpleUpdateDeleteTest(_SimpleUpdateDeleteTest):
+    @sa_testing.variation("criteria", ["rows", "norows", "aggregate"])
+    @sa_testing.requires.update_where_target_in_subquery
+    def test_update_where_target_in_subquery(self, connection, criteria):
+        t = self.tables.plain_pk
+        if criteria.rows:
+            subquery = select(t.c.id).where(t.c.id < 3)
+            expected = [(1, "updated"), (2, "updated"), (3, "d3")]
+            rowcount = 2
+        elif criteria.norows:
+            subquery = select(t.c.id).where(t.c.id < 0)
+            expected = [(1, "d1"), (2, "d2"), (3, "d3")]
+            rowcount = 0
+        elif criteria.aggregate:
+            subquery = select(func.max(t.c.id))
+            expected = [(1, "d1"), (2, "d2"), (3, "updated")]
+            rowcount = 1
+        else:
+            criteria.fail()
+
+        r = connection.execute(t.update().where(t.c.id.in_(subquery)), {"data": "updated"})
+        assert not r.is_insert
+        assert not r.returns_rows
+        assert r.rowcount == rowcount
+        eq_(connection.execute(t.select().order_by(t.c.id)).fetchall(), expected)
 
 
 class ComponentReflectionTest(_ComponentReflectionTest):
