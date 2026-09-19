@@ -122,19 +122,25 @@ class Requirements(SuiteRequirements):
 
     @property
     def ctes_with_update_delete(self):
-        return unsupported("Athena does not support WITH preceding UPDATE or DELETE.")
+        return exclusions.skip_if(
+            lambda _: True, "Athena does not support WITH preceding UPDATE or DELETE."
+        )
 
     @property
     def ctes_on_dml(self):
-        return unsupported("Athena does not support INSERT, UPDATE, or DELETE inside a CTE.")
+        return exclusions.skip_if(
+            lambda _: True, "Athena does not support INSERT, UPDATE, or DELETE inside a CTE."
+        )
 
     @property
     def update_from(self):
-        return unsupported("Athena does not support UPDATE ... FROM.")
+        return exclusions.skip_if(lambda _: True, "Athena does not support UPDATE ... FROM.")
 
     @property
     def delete_from(self):
-        return unsupported("Athena does not support DELETE ... USING or multi-table DELETE.")
+        return exclusions.skip_if(
+            lambda _: True, "Athena does not support DELETE ... USING or multi-table DELETE."
+        )
 
     @property
     def views(self):
