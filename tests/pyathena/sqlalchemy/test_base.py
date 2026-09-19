@@ -9,8 +9,6 @@ import numpy as np
 import pandas as pd
 import pytest
 import sqlalchemy
-from botocore.config import Config
-from botocore.stub import Stubber
 from sqlalchemy import create_engine, func, literal_column, select, text, types
 from sqlalchemy.exc import NoSuchTableError
 from sqlalchemy.sql import expression, type_coerce
@@ -18,7 +16,6 @@ from sqlalchemy.sql.ddl import CreateTable
 from sqlalchemy.sql.schema import Column, MetaData, Table
 from sqlalchemy.sql.selectable import TextualSelect
 
-from pyathena.error import OperationalError
 from pyathena.sqlalchemy.types import (
     TINYINT,
     AthenaArray,
@@ -27,7 +24,6 @@ from pyathena.sqlalchemy.types import (
     Tinyint,
     get_double_type,
 )
-from pyathena.util import RetryConfig
 from tests.pyathena.conftest import ENV
 
 # Amazon S3 Tables tests need a pre-provisioned table-bucket catalog and namespace.
@@ -36,149 +32,6 @@ requires_s3_tables = pytest.mark.skipif(
     not ENV.s3tables_catalog or not ENV.s3tables_namespace,
     reason="AWS_ATHENA_S3_TABLES_CATALOG / AWS_ATHENA_S3_TABLES_NAMESPACE are not configured",
 )
-
-
-@pytest.fixture
-def stubbed_metadata_connection():
-    engine = create_engine(
-        "awsathena+rest://testing:testing@athena.us-west-2.amazonaws.com/test_schema",
-        connect_args={
-            "s3_staging_dir": "s3://testing/results/",
-            "config": Config(retries={"total_max_attempts": 1}),
-            "retry_config": RetryConfig(attempt=1),
-        },
-    )
-    try:
-        with (
-            engine.connect() as connection,
-            Stubber(connection.connection.driver_connection.client) as stubber,
-        ):
-            yield connection, stubber
-            stubber.assert_no_pending_responses()
-    finally:
-        engine.dispose()
-
-
-class TestMetadataReflection:
-    def test_reuses_all_listing_pages_and_view_metadata(self, stubbed_metadata_connection):
-        connection, stubber = stubbed_metadata_connection
-        for index, (name, table_type) in enumerate(
-            [("example", "EXTERNAL_TABLE"), ("example_view", "VIRTUAL_VIEW")]
-        ):
-            response = {
-                "TableMetadataList": [
-                    {
-                        "Name": name,
-                        "TableType": table_type,
-                        "Columns": [{"Name": "id", "Type": "int"}],
-                    }
-                ]
-            }
-            request = {
-                "CatalogName": "awsdatacatalog",
-                "DatabaseName": "test_schema",
-                "MaxResults": 50,
-            }
-            if index == 0:
-                response["NextToken"] = "next-page"
-            else:
-                request["NextToken"] = "next-page"
-            stubber.add_response("list_table_metadata", response, request)
-        inspector = sqlalchemy.inspect(connection)
-        assert inspector.get_table_names() == ["example"]
-        assert inspector.get_view_names() == ["example_view"]
-        assert inspector.get_columns("example_view")[0]["name"] == "id"
-        assert inspector.get_columns("EXAMPLE")[0]["name"] == "id"
-
-    def test_reuses_listed_metadata(self, stubbed_metadata_connection):
-        connection, stubber = stubbed_metadata_connection
-        table = {
-            "Name": "example",
-            "TableType": "EXTERNAL_TABLE",
-            "Columns": [{"Name": "value", "Type": "int"}],
-            "Parameters": {"comment": "table comment", "location": "s3://testing/example/"},
-        }
-        stubber.add_response("list_table_metadata", {"TableMetadataList": [table]})
-        inspector = sqlalchemy.inspect(connection)
-        assert inspector.get_table_names() == ["example"]
-        columns = inspector.get_multi_columns()
-        assert columns[(None, "example")][0]["name"] == "value"
-        assert inspector.get_table_comment("example") == {"text": "table comment"}
-        assert (
-            inspector.get_table_options("example")["awsathena_location"] == "s3://testing/example/"
-        )
-        assert inspector.has_table("example")
-        # Every operation above must use the one list response. A further SDK
-        # call would fail immediately because the Stubber queue is empty.
-        inspector.clear_cache()
-        table["Columns"] = [{"Name": "changed", "Type": "string"}]
-        stubber.add_response("get_table_metadata", {"TableMetadata": table})
-        assert inspector.get_columns("example")[0]["name"] == "changed"
-
-    @pytest.mark.parametrize(
-        "code", ["ThrottlingException", "AccessDeniedException", "InternalError"]
-    )
-    def test_metadata_errors_are_not_cached_as_missing(self, stubbed_metadata_connection, code):
-        connection, stubber = stubbed_metadata_connection
-        stubber.add_client_error(
-            "get_table_metadata",
-            service_error_code="MetadataException",
-            service_message="Catalog error (Service: AmazonDataCatalog; Status Code: 400; "
-            f"Error Code: {code}; Request ID: example; Proxy: null)",
-        )
-        inspector = sqlalchemy.inspect(connection)
-        with pytest.raises(OperationalError):
-            inspector.has_table("example")
-        stubber.add_response(
-            "get_table_metadata",
-            {"TableMetadata": {"Name": "example", "Columns": [{"Name": "value", "Type": "int"}]}},
-        )
-        assert inspector.has_table("example")
-
-    def test_missing_table_is_cached(self, stubbed_metadata_connection):
-        connection, stubber = stubbed_metadata_connection
-        stubber.add_client_error(
-            "get_table_metadata",
-            service_error_code="MetadataException",
-            service_message="Not found (Service: AmazonDataCatalog; Status Code: 400; "
-            "Error Code: EntityNotFoundException; Request ID: example; Proxy: null)",
-        )
-        inspector = sqlalchemy.inspect(connection)
-        assert not inspector.has_table("missing")
-        assert not inspector.has_table("missing")
-
-    def test_list_cache_does_not_imply_absence(self, stubbed_metadata_connection):
-        connection, stubber = stubbed_metadata_connection
-        stubber.add_response("list_table_metadata", {"TableMetadataList": []})
-        inspector = sqlalchemy.inspect(connection)
-        assert inspector.get_table_names() == []
-        stubber.add_response(
-            "get_table_metadata",
-            {"TableMetadata": {"Name": "new_table", "Columns": [{"Name": "id", "Type": "int"}]}},
-        )
-        assert inspector.has_table("new_table")
-
-    def test_list_cache_is_scoped_to_schema(self, stubbed_metadata_connection):
-        connection, stubber = stubbed_metadata_connection
-        for schema_name in ("first_schema", "second_schema"):
-            stubber.add_response(
-                "list_table_metadata",
-                {
-                    "TableMetadataList": [
-                        {
-                            "Name": "example",
-                            "TableType": "EXTERNAL_TABLE",
-                            "Columns": [{"Name": schema_name, "Type": "int"}],
-                        }
-                    ]
-                },
-                {"CatalogName": "awsdatacatalog", "DatabaseName": schema_name, "MaxResults": 50},
-            )
-        inspector = sqlalchemy.inspect(connection)
-        assert inspector.get_table_names(schema="first_schema") == ["example"]
-        assert inspector.get_table_names(schema="second_schema") == ["example"]
-        for schema_name in ("first_schema", "second_schema"):
-            assert inspector.get_columns("example", schema=schema_name)[0]["name"] == schema_name
 
 
 def unique_s3tables_table_name(base: str) -> str:

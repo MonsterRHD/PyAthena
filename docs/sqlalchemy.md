@@ -95,7 +95,6 @@ The dialect reuses these positive results within the same Inspector, so subseque
 
 Metadata throttling and permission errors remain errors rather than being reported as missing tables.
 PyAthena recognizes Glue error codes in Athena's `MetadataException` service-error envelope and applies `RetryConfig.exceptions` to those codes.
-Its retry delays use exponential backoff with jitter to avoid synchronized retry bursts.
 SDK retries and PyAthena retries are separate layers, so increasing both attempt limits can multiply requests and waiting time.
 Adaptive SDK retries regulate individual clients, not the aggregate traffic from independent CI runners.
 

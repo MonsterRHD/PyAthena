@@ -7,7 +7,7 @@ from re import Pattern
 from typing import Any
 
 import tenacity
-from tenacity import after_log, retry_if_exception, stop_after_attempt, wait_random_exponential
+from tenacity import after_log, retry_if_exception, stop_after_attempt, wait_exponential
 
 from pyathena import DataError
 
@@ -81,7 +81,7 @@ class RetryConfig:
     """Configuration for automatic retry behavior on failed API calls.
 
     This class configures how PyAthena handles transient failures when
-    communicating with AWS services. It uses exponential backoff with jitter and
+    communicating with AWS services. It uses exponential backoff with
     customizable parameters to retry failed operations.
 
     Attributes:
@@ -207,7 +207,7 @@ def retry_api_call(
     retry = tenacity.Retrying(
         retry=retry_if_exception(_is_retryable),
         stop=stop_after_attempt(config.attempt),
-        wait=wait_random_exponential(
+        wait=wait_exponential(
             multiplier=config.multiplier,
             max=config.max_delay,
             exp_base=config.exponential_base,
