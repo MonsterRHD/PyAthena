@@ -1,6 +1,8 @@
+import json
 from dataclasses import replace
 
 import pytest
+from pyathena_bench.__main__ import main
 from pyathena_bench.cases import matrix
 from pyathena_bench.config import Settings, identifier, select_sql
 
@@ -59,3 +61,30 @@ def test_flat_projection_and_nested_projection_share_the_snapshot():
     assert "file.filename AS filename" in flat
     assert "project, file, details, http" in nested
     assert "LIMIT" not in flat
+
+
+@pytest.mark.parametrize("family", ["cursor", "dict", "arrow"])
+def test_plan_page_warning_uses_smallest_selected_arraysize(tmp_path, capsys, family):
+    config = tmp_path / "config.toml"
+    config.write_text("[scales]\nxlarge = 10000000\n")
+    assert (
+        main(
+            [
+                "--config",
+                str(config),
+                "plan",
+                "--suite",
+                "single",
+                "--scale",
+                "xlarge",
+                "--family",
+                family,
+            ]
+        )
+        == 0
+    )
+    warnings = json.loads(capsys.readouterr().out)["warnings"]
+    if family == "arrow":
+        assert warnings == []
+    else:
+        assert "arraysize 100 needs >= 100000" in warnings[0]

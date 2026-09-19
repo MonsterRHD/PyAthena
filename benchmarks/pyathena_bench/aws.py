@@ -311,9 +311,7 @@ def cleanup(
             "ResultConfiguration", {}
         ).get("OutputLocation", "").startswith(f"s3://{bucket}/{root}"):
             raise ValueError("Manifest contains a query outside this run")
-        if query["ResultConfiguration"]["OutputLocation"].startswith(
-            f"s3://{bucket}/{prefix}"
-        ) and query["Status"]["State"] in {"RUNNING", "QUEUED"}:
+        if query["Status"]["State"] in {"RUNNING", "QUEUED"}:
             ids.add(entry["query_id"])
     for page in athena.get_paginator("list_query_executions").paginate(
         WorkGroup=settings.workgroup
@@ -332,7 +330,7 @@ def cleanup(
                     query.get("WorkGroup") == settings.workgroup
                     and query.get("ResultConfiguration", {})
                     .get("OutputLocation", "")
-                    .startswith(f"s3://{bucket}/{prefix}")
+                    .startswith(f"s3://{bucket}/{root}")
                     and query["Status"]["State"] in {"RUNNING", "QUEUED"}
                 ):
                     ids.add(query["QueryExecutionId"])

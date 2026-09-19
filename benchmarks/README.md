@@ -219,6 +219,7 @@ The parent stops a trial at the configured timeout or RSS fraction of physical R
 The suite stops at the first failed trial, including a failed warmup, so outstanding queries cannot affect later measurements.
 Inspect the recorded failure and quiesce the trial outputs with `cleanup --trials-only --execute` before retrying selected cases in a new output directory against the same manifest.
 This preserves the input snapshots and initialization fixtures, so comparisons still use identical rows.
+Both cleanup modes cancel and wait for all active queries belonging to the run, including orphaned preparation or fixture queries; `--trials-only` narrows deletion, not cancellation.
 Retain the previous local reports before cleaning remote trial outputs.
 An external kill is reported as a worker exit, not automatically as an out-of-memory error.
 Use `cleanup` after interrupted runs to discover outstanding queries whose IDs were not returned before a worker died.
@@ -233,7 +234,7 @@ uv run --no-sync python -m pyathena_bench run \
 ```
 
 There is no automatic continuation of a partially recorded trial; rerun the selected comparison with the same manifest.
-Large API row cases require many result pages (at least 10,000 pages for 10 million rows) and may exceed the default one-hour timeout.
+Large API row cases may exceed the default one-hour timeout: 10 million rows require at least 10,000 pages with arraysize 1000, or 100,000 pages with arraysize 100.
 Choose the timeout using a smaller-scale pilot before the full run.
 Do not run two orchestrators concurrently on the same dedicated host.
 

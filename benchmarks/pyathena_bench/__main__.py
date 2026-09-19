@@ -93,6 +93,7 @@ def main(argv: list[str] | None = None) -> int:
                     "s3_prefix": f"s3://{resources['Bucket']}/runs/{manifest['run_id']}/"
                     + ("trials/" if args.trials_only else ""),
                     "preserve_inputs_and_fixtures": args.trials_only,
+                    "query_output_prefix": f"s3://{resources['Bucket']}/runs/{manifest['run_id']}/",
                 },
                 indent=2,
             )
@@ -113,6 +114,14 @@ def main(argv: list[str] | None = None) -> int:
         if not cases:
             raise ValueError("No cases match the selected filters")
         if args.command == "plan":
+            page_size = min(
+                (
+                    c.arraysize
+                    for c in cases
+                    if c.family in {"cursor", "dict"} and c.suite != "init"
+                ),
+                default=0,
+            )
             sys.stdout.write(
                 json.dumps(
                     {
@@ -122,13 +131,11 @@ def main(argv: list[str] | None = None) -> int:
                         * (settings.warmups + settings.repetitions),
                         "cases": [{"id": c.id, **asdict(c)} for c in cases],
                         "warnings": [
-                            f"{scale}: row APIs need >= {(settings.scales[scale] + 999) // 1000} "
+                            f"{scale}: arraysize {page_size} needs >= "
+                            f"{(settings.scales[scale] + page_size - 1) // page_size} "
                             "GetQueryResults pages per query; use a pilot to choose timeout_seconds"
                             for scale in scales
-                            if settings.scales[scale] >= 1_000_000
-                            and any(
-                                c.family in {"cursor", "dict"} and c.suite != "init" for c in cases
-                            )
+                            if settings.scales[scale] >= 1_000_000 and page_size
                         ],
                     },
                     indent=2,

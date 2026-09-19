@@ -183,7 +183,9 @@ def test_cleanup_batches_history_and_can_preserve_snapshots(
                     {
                         "QueryExecutionId": q,
                         "WorkGroup": "pyathena",
-                        "Status": {"State": "RUNNING" if q in {"0", "1", "2"} else "SUCCEEDED"},
+                        "Status": {
+                            "State": "RUNNING" if q in {"0", "1", "2", "3"} else "SUCCEEDED"
+                        },
                         "ResultConfiguration": {
                             "OutputLocation": "s3://temporary/"
                             + (
@@ -191,6 +193,8 @@ def test_cleanup_batches_history_and_can_preserve_snapshots(
                                 if q == "0"
                                 else root + "prepare/"
                                 if q == "1"
+                                else root + "fixtures/f/"
+                                if q == "3"
                                 else "foreign/"
                             )
                         },
@@ -210,7 +214,7 @@ def test_cleanup_batches_history_and_can_preserve_snapshots(
     data = manifest()
     cleanup(Settings(), data, tmp_path / "manifest.json", trials_only=trials_only)
     assert [len(value) for action, value in actions if action == "batch"] == [50, 1]
-    assert ("cancel", {"0"} if trials_only else {"0", "1"}) in actions
+    assert ("cancel", {"0", "1", "3"}) in actions
     assert ("delete_table", trial_table) in actions
     assert (("delete_table", f"b_{RUN}_small") in actions) is not trials_only
     assert ("delete_table", "foreign") not in actions

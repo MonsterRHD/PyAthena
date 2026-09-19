@@ -1,6 +1,7 @@
 import asyncio
 import weakref
 from concurrent.futures import Future
+from io import BytesIO
 from types import SimpleNamespace
 
 import boto3
@@ -258,7 +259,13 @@ async def test_init_uses_real_resultset_constructors_and_validates_rows(monkeypa
 
     monkeypatch.setattr(BaseClient, "_make_api_call", no_network)
     monkeypatch.setattr(RESULT_SETS["cursor"], "_pre_fetch", prefetch)
-    monkeypatch.setattr(RESULT_SETS["s3fs"], "_init_csv_reader", lambda self: None)
+    csv_bytes = b'"id"\n"1"\n'
+    monkeypatch.setattr(RESULT_SETS["s3fs"], "_get_content_length", lambda self: len(csv_bytes))
+    monkeypatch.setattr(
+        RESULT_SETS["s3fs"],
+        "_create_s3_file_system",
+        lambda self: SimpleNamespace(_open=lambda *args, **kwargs: BytesIO(csv_bytes)),
+    )
     monkeypatch.setattr(RESULT_SETS["pandas"], "_as_pandas", lambda self: pd.DataFrame({"id": [1]}))
     monkeypatch.setattr(RESULT_SETS["polars"], "_as_polars", lambda self: pl.DataFrame({"id": [1]}))
     monkeypatch.setattr(RESULT_SETS["arrow"], "_as_arrow", lambda self: pa.table({"id": [1]}))
