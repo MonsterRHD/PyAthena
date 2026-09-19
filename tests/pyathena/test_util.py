@@ -129,3 +129,32 @@ def test_retry_metadata_errors(code, message, exceptions, expected_calls):
     else:
         assert retry_api_call(call, config) == "success"
     assert calls == expected_calls
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_retry_api_call_with_single_pass_exceptions(wrapped):
+    error = ClientError(
+        {
+            "Error": {
+                "Code": "MetadataException" if wrapped else "ThrottlingException",
+                "Message": "Rate exceeded (Service: AmazonDataCatalog; Status Code: 400; "
+                "Error Code: ThrottlingException; Request ID: example; Proxy: null)",
+            }
+        },
+        "GetTableMetadata",
+    )
+    config = RetryConfig(
+        exceptions=iter(("ThrottlingException",)), attempt=3, multiplier=0, max_delay=0
+    )
+    for _ in range(2):
+        calls = 0
+
+        def call():
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                raise error
+            return "success"
+
+        assert retry_api_call(call, config) == "success"
+        assert calls == 3

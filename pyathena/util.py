@@ -85,7 +85,7 @@ class RetryConfig:
     customizable parameters to retry failed operations.
 
     Attributes:
-        exceptions: List of AWS exception names to retry on.
+        exceptions: Tuple of AWS exception names to retry on.
         attempt: Maximum number of retry attempts.
         multiplier: Base multiplier for exponential backoff.
         max_delay: Maximum delay between retries in seconds.
@@ -128,7 +128,7 @@ class RetryConfig:
         max_delay: int = 100,
         exponential_base: int = 2,
     ) -> None:
-        self.exceptions = exceptions
+        self.exceptions = tuple(exceptions)
         self.attempt = attempt
         self.multiplier = multiplier
         self.max_delay = max_delay
