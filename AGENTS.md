@@ -10,6 +10,12 @@ PyAthena is a Python DB API 2.0 (PEP 249) compliant client for Amazon Athena. Se
 
 - **NEVER** commit directly to `master` — always create a feature branch and PR
 - Create PRs as drafts: `gh pr create --draft`
+- Use a dedicated worktree for each PR and follow the repository's PR template.
+- For PR delivery, follow [development-workflow](.agents/skills/development-workflow/SKILL.md): create the draft, complete two distinct self-reviews, collect an independent review, and check current CI before Ready.
+- Run [self-review](.agents/skills/self-review/SKILL.md) for behavior and implementation, then [self-review-round-two](.agents/skills/self-review-round-two/SKILL.md) for compatibility, operational consequences, and factual claims.
+- Record review findings and outcomes inline on relevant diff lines using the GitHub review API's `comments` array with an empty review body.
+- Use `gh` for GitHub operations, and write commits, PR text, and review comments in English.
+- A review-only request keeps its specified scope and side-effect limits; it does not start PR delivery.
 
 ### Import Rules
 
