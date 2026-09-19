@@ -515,18 +515,6 @@ class AthenaPandasResultSet(AthenaResultSet):
         if length == 0:
             return pd.DataFrame()
 
-        if self.output_location.endswith(".txt"):
-            sep = "\t"
-            header = None
-            description = self.description if self.description else []
-            names = [d[0] for d in description]
-        elif self.output_location.endswith(".csv"):
-            sep = ","
-            header = 0
-            names = None
-        else:
-            return pd.DataFrame()
-
         # Chunksize determination with user preference priority
         effective_chunksize = self._chunksize
 
@@ -540,136 +528,14 @@ class AthenaPandasResultSet(AthenaResultSet):
                 )
 
         csv_engine = self._get_csv_engine(length, effective_chunksize)
-        read_csv_kwargs: dict[str, Any] = {
-            "sep": sep,
-            "header": header,
-            "names": names,
-            "dtype": self.dtypes,
-            "converters": self.converters,
-            "parse_dates": self.parse_dates,
-            "skip_blank_lines": False,
-            "keep_default_na": self._keep_default_na,
-            "na_values": self._na_values,
-            "quoting": self._quoting,
-            "storage_options": {
-                "connection": self.connection,
-                "default_block_size": self._block_size,
-                "default_cache_type": self._cache_type,
-                "max_workers": self._max_workers,
-            },
-            "chunksize": effective_chunksize,
-            "engine": csv_engine,
-        }
-
-        # Engine-specific compatibility adjustments
-        if csv_engine == "pyarrow":
-            # PyArrow doesn't support these pandas-specific options
-            read_csv_kwargs.pop("quoting", None)
-            read_csv_kwargs.pop("converters", None)
-
-        read_csv_kwargs.update(self._kwargs)
+        read_csv_kwargs = self._get_csv_read_options(csv_engine, effective_chunksize)
 
         try:
             source: str | TextIOWrapper = self.output_location
-            description = self.description if self.description else []
-            binary_columns = {
-                i
-                for i, d in enumerate(description)
-                if d[1] == "varbinary" and d[1] in self._converter.mappings
-            }
-            if (
-                binary_columns
-                and "converters" not in self._kwargs
-                and self.output_location.endswith(".csv")
-                and read_csv_kwargs.get("header") == 0
-                and read_csv_kwargs.get("skiprows") is None
-                and read_csv_kwargs.get("dialect") is None
-                and read_csv_kwargs.get("quoting") != csv.QUOTE_NONE
-                and read_csv_kwargs.get("quotechar", '"') == '"'
-            ):
-                column_names = [d[0] for d in description]
-                converters = read_csv_kwargs["converters"]
-                if (
-                    len(set(column_names)) != len(column_names)
-                    or not all(column_names)
-                    or self._kwargs.keys()
-                    & {
-                        "names",
-                        "usecols",
-                        "sep",
-                        "delimiter",
-                        "doublequote",
-                        "escapechar",
-                        "skipinitialspace",
-                    }
-                ):
-                    # Resolve customized or duplicate column names with pandas.
-                    header_buffer = StringIO()
-                    csv.writer(header_buffer, quoting=csv.QUOTE_ALL).writerow(column_names)
-                    header_options = {
-                        key: read_csv_kwargs[key]
-                        for key in (
-                            "sep",
-                            "delimiter",
-                            "names",
-                            "engine",
-                            "quoting",
-                            "quotechar",
-                            "doublequote",
-                            "escapechar",
-                            "skipinitialspace",
-                        )
-                        if key in read_csv_kwargs
-                    }
-                    column_names = pd.read_csv(
-                        StringIO(header_buffer.getvalue()), header=0, nrows=0, **header_options
-                    ).columns.tolist()
-                    selected_names = set(column_names)
-                    if read_csv_kwargs.get("usecols") is not None:
-                        selected_names = set(
-                            pd.read_csv(
-                                StringIO(header_buffer.getvalue()),
-                                header=0,
-                                nrows=0,
-                                usecols=read_csv_kwargs["usecols"],
-                                **header_options,
-                            ).columns
-                        )
-                    if len(column_names) == len(description):
-                        converters = {
-                            name: self._converter.get(d[1])
-                            for name, d in zip(column_names, description, strict=True)
-                            if d[1] in self._converter.mappings and name in selected_names
-                        }
-                        binary_columns = {
-                            i for i in binary_columns if column_names[i] in selected_names
-                        }
-                    else:
-                        binary_columns = set()
-                for index in binary_columns:
-                    name = column_names[index]
-                    converters[name] = partial(_convert_binary_csv, converters[name])
-            else:
-                binary_columns = set()
+            binary_columns = self._configure_binary_csv_read(read_csv_kwargs, pd.read_csv)
             if binary_columns:
-                read_csv_kwargs["converters"] = converters
                 storage_options = read_csv_kwargs.pop("storage_options", None) or {}
-                self._csv_stream = TextIOWrapper(
-                    BufferedReader(
-                        BinaryCSVReader(
-                            filesystem_open(
-                                self.output_location,
-                                mode="rt",
-                                encoding="utf-8",
-                                newline="",
-                                **storage_options,
-                            ).open(),
-                            binary_columns,
-                        )
-                    ),
-                    encoding="utf-8",
-                    newline="",
-                )
+                self._csv_stream = self._open_binary_csv_stream(binary_columns, storage_options)
                 source = self._csv_stream
             result = pd.read_csv(source, **read_csv_kwargs)
             if isinstance(result, pd.DataFrame) and self._csv_stream is not None:
@@ -691,6 +557,166 @@ class AthenaPandasResultSet(AthenaResultSet):
                 self._csv_stream.close()
             _logger.exception(f"Failed to read {self.output_location}.")
             raise OperationalError(*e.args) from e
+
+    def _get_csv_read_options(self, csv_engine: str, chunksize: int | None) -> dict[str, Any]:
+        """Build pandas options for Athena CSV or tab-separated results."""
+        if self.output_location and self.output_location.endswith(".txt"):
+            sep = "\t"
+            header = None
+            names = [d[0] for d in self.description or []]
+        else:
+            sep = ","
+            header = 0
+            names = None
+
+        read_csv_kwargs: dict[str, Any] = {
+            "sep": sep,
+            "header": header,
+            "names": names,
+            "dtype": self.dtypes,
+            "converters": self.converters,
+            "parse_dates": self.parse_dates,
+            "skip_blank_lines": False,
+            "keep_default_na": self._keep_default_na,
+            "na_values": self._na_values,
+            "quoting": self._quoting,
+            "storage_options": {
+                "connection": self.connection,
+                "default_block_size": self._block_size,
+                "default_cache_type": self._cache_type,
+                "max_workers": self._max_workers,
+            },
+            "chunksize": chunksize,
+            "engine": csv_engine,
+        }
+
+        # Engine-specific compatibility adjustments
+        if csv_engine == "pyarrow":
+            # PyArrow doesn't support these pandas-specific options
+            read_csv_kwargs.pop("quoting", None)
+            read_csv_kwargs.pop("converters", None)
+
+        read_csv_kwargs.update(self._kwargs)
+
+        return read_csv_kwargs
+
+    @staticmethod
+    def _resolve_csv_column_names(
+        column_names: list[Any],
+        read_csv_kwargs: dict[str, Any],
+        read_csv: Callable[..., DataFrame],
+    ) -> tuple[list[Any], set[Any]]:
+        """Resolve customized or duplicate column names with pandas' header parser."""
+        header_buffer = StringIO()
+        csv.writer(header_buffer, quoting=csv.QUOTE_ALL).writerow(column_names)
+        header_options = {
+            key: read_csv_kwargs[key]
+            for key in (
+                "sep",
+                "delimiter",
+                "names",
+                "engine",
+                "quoting",
+                "quotechar",
+                "doublequote",
+                "escapechar",
+                "skipinitialspace",
+            )
+            if key in read_csv_kwargs
+        }
+        column_names = read_csv(
+            StringIO(header_buffer.getvalue()), header=0, nrows=0, **header_options
+        ).columns.tolist()
+        selected_names = set(column_names)
+        if read_csv_kwargs.get("usecols") is not None:
+            selected_names = set(
+                read_csv(
+                    StringIO(header_buffer.getvalue()),
+                    header=0,
+                    nrows=0,
+                    usecols=read_csv_kwargs["usecols"],
+                    **header_options,
+                ).columns
+            )
+        return column_names, selected_names
+
+    def _configure_binary_csv_read(
+        self, read_csv_kwargs: dict[str, Any], read_csv: Callable[..., DataFrame]
+    ) -> set[int]:
+        """Wrap binary converters and return column positions needing NULL preservation."""
+        if (
+            "varbinary" not in self._converter.mappings
+            or "converters" in self._kwargs
+            or not self.output_location
+            or not self.output_location.endswith(".csv")
+            or read_csv_kwargs.get("header") != 0
+            or read_csv_kwargs.get("skiprows") is not None
+            or read_csv_kwargs.get("dialect") is not None
+            or read_csv_kwargs.get("quoting") == csv.QUOTE_NONE
+            or read_csv_kwargs.get("quotechar", '"') != '"'
+        ):
+            return set()
+
+        description = self.description or []
+        binary_columns = {i for i, d in enumerate(description) if d[1] == "varbinary"}
+        if not binary_columns:
+            return set()
+
+        column_names = [d[0] for d in description]
+        converters = read_csv_kwargs["converters"]
+        if (
+            len(set(column_names)) != len(column_names)
+            or not all(column_names)
+            or self._kwargs.keys()
+            & {
+                "names",
+                "usecols",
+                "sep",
+                "delimiter",
+                "doublequote",
+                "escapechar",
+                "skipinitialspace",
+            }
+        ):
+            column_names, selected_names = self._resolve_csv_column_names(
+                column_names, read_csv_kwargs, read_csv
+            )
+            if len(column_names) != len(description):
+                return set()
+            converters = {
+                name: self._converter.get(d[1])
+                for name, d in zip(column_names, description, strict=True)
+                if d[1] in self._converter.mappings and name in selected_names
+            }
+            binary_columns = {i for i in binary_columns if column_names[i] in selected_names}
+
+        if binary_columns:
+            for index in binary_columns:
+                name = column_names[index]
+                converters[name] = partial(_convert_binary_csv, converters[name])
+            read_csv_kwargs["converters"] = converters
+        return binary_columns
+
+    def _open_binary_csv_stream(
+        self, binary_columns: set[int], storage_options: dict[str, Any]
+    ) -> TextIOWrapper:
+        """Open a stream that preserves binary NULL fields and original CSV newlines."""
+        return TextIOWrapper(
+            BufferedReader(
+                BinaryCSVReader(
+                    filesystem_open(
+                        self.output_location,
+                        mode="rt",
+                        encoding="utf-8",
+                        newline="",
+                        **storage_options,
+                    ).open(),
+                    binary_columns,
+                )
+            ),
+            encoding="utf-8",
+            newline="",
+        )
 
     def _read_parquet(self, engine) -> DataFrame:
         import pandas as pd
