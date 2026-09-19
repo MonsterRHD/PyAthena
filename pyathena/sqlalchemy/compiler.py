@@ -25,6 +25,7 @@ from sqlalchemy.sql.elements import (
     _textual_label_reference,
 )
 from sqlalchemy.sql.schema import Column
+from sqlalchemy.sql.selectable import ScalarSelect
 
 from pyathena.model import (
     AthenaFileFormat,
@@ -285,8 +286,10 @@ class AthenaStatementCompiler(SQLCompiler):
             lateral_from_linter=lateral_from_linter,
         )
         aggregate = binary.right
-        if isinstance(aggregate, CollectionAggregate) and isinstance(
-            aggregate.element.type, types.ARRAY
+        if (
+            isinstance(aggregate, CollectionAggregate)
+            and not isinstance(aggregate.element, ScalarSelect)
+            and isinstance(aggregate.element.type, types.ARRAY)
         ):
             variable = self._array_lambda_name()
             predicate = binary._clone()
@@ -306,6 +309,7 @@ class AthenaStatementCompiler(SQLCompiler):
             if not isinstance(bounds.step, Null) and not (
                 isinstance(bounds.step, BindParameter)
                 and bounds.step.unique
+                and type(bounds.step.value) is int
                 and bounds.step.value == 1
             ):
                 raise exc.CompileError("Athena ARRAY slices support only step=None or step=1")
