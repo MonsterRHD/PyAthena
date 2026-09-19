@@ -98,3 +98,53 @@ class TestAsyncSQLAlchemyAthena:
         assert actual["default"] is None
         assert not actual["autoincrement"]
         assert actual["comment"] == "some comment"
+
+    @pytest.mark.parametrize(
+        ("operation", "expected"),
+        [
+            pytest.param(
+                "INSERT INTO {table} SELECT id+10, group_id+10, value "
+                "FROM {table} WHERE group_id=:group_id",
+                [(1, 10), (2, 20), (3, 30), (11, 10), (12, 20), (13, 30)],
+                id="insert",
+            ),
+            pytest.param(
+                "UPDATE {table} SET value=value+1 WHERE group_id=:group_id",
+                [(1, 11), (2, 21), (3, 31)],
+                id="update",
+            ),
+            pytest.param("DELETE FROM {table} WHERE group_id=:group_id", [], id="delete"),
+        ],
+    )
+    async def test_executemany_rowcount(self, async_engine, executemany_table, operation, expected):
+        _, conn = async_engine
+        statement = text(operation.format(table=executemany_table))
+        result = await conn.execute(statement, [{"group_id": 1}, {"group_id": 2}, {"group_id": 99}])
+        assert result.rowcount == 3
+        assert not result.returns_rows
+        with pytest.raises(sqlalchemy.exc.ResourceClosedError):
+            result.fetchall()
+
+        result = await conn.execute(statement, [{"group_id": 99}, {"group_id": 100}])
+        assert result.rowcount == 0
+        rows = (
+            await conn.execute(text(f"SELECT id, value FROM {executemany_table} ORDER BY id"))
+        ).fetchall()
+        assert rows == expected
+
+    async def test_executemany_failure(self, async_engine, executemany_table):
+        _, conn = async_engine
+        statement = text(
+            f"UPDATE {executemany_table} SET value=value+1 "
+            "WHERE group_id=CAST(:group_id AS INTEGER)"
+        )
+        with pytest.raises(sqlalchemy.exc.OperationalError):
+            await conn.execute(
+                statement, [{"group_id": "1"}, {"group_id": "invalid"}, {"group_id": "2"}]
+            )
+        rows = (
+            await conn.execute(text(f"SELECT id, value FROM {executemany_table} ORDER BY id"))
+        ).fetchall()
+        assert rows == [(1, 11), (2, 21), (3, 30)]
+        result = await conn.execute(statement, {"group_id": "2"})
+        assert result.rowcount == 1

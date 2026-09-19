@@ -19,7 +19,6 @@ del IdentityAutoincrementTest  # noqa: F821
 del JoinTest  # noqa: F821
 del LongNameBlowoutTest  # noqa: F821
 del QuotedNameArgumentTest  # noqa: F821
-del RowCountTest  # noqa: F821
 del TimeMicrosecondsTest  # noqa: F821
 del TimeTest  # noqa: F821
 del TimestampMicrosecondsTest  # noqa: F821
@@ -39,11 +38,6 @@ class InsertBehaviorTest(_InsertBehaviorTest):
 
     @pytest.mark.skip("Athena does not support auto-incrementing.")
     def test_insert_from_select_autoinc_no_rows(self, connection):
-        pass
-
-    @pytest.mark.skip("TODO")
-    def test_no_results_for_non_returning_insert(self, connection, style, executemany):
-        # TODO
         pass
 
 

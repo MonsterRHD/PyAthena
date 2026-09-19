@@ -71,9 +71,8 @@ class AsyncAdapt_pyathena_cursor:
         seq_of_parameters: list[dict[str, Any] | list[str] | None],
         **kwargs: Any,
     ) -> None:
-        for parameters in seq_of_parameters:
-            await_only(self._cursor.execute(operation, parameters, **kwargs))
         self._rows.clear()
+        await_only(self._cursor.executemany(operation, seq_of_parameters, **kwargs))
 
     def fetchone(self) -> Any:
         if self._rows:

@@ -418,10 +418,11 @@ class WithAsyncFetch(AioBaseCursor, CursorIterator, WithResultSet):
 
     @property
     def rowcount(self) -> int:
-        return self.result_set.rowcount if self.result_set else -1
+        return self.result_set.rowcount if self.result_set else self._rowcount
 
     def close(self) -> None:
         """Close the cursor and release associated resources."""
+        self._rowcount = -1
         if self.result_set and not self.result_set.is_closed:
             self.result_set.close()
 
@@ -433,15 +434,34 @@ class WithAsyncFetch(AioBaseCursor, CursorIterator, WithResultSet):
     ) -> None:
         """Execute a SQL query multiple times with different parameters.
 
+        On success, ``rowcount`` is the sum of the affected row counts, or
+        -1 if any execution has an unknown count. An empty parameter list
+        sets it to 0. On failure or cancellation, it is -1; earlier executions
+        are not rolled back. Result sets are discarded.
+
+        On failure, ``query_id`` retains the current query ID when available.
+        If parameter iteration fails, this can identify the last successful
+        execution.
+
         Args:
             operation: SQL query string to execute.
             seq_of_parameters: Sequence of parameter sets, one per execution.
             **kwargs: Additional keyword arguments passed to each ``execute()``.
         """
-        for parameters in seq_of_parameters:
-            await self.execute(operation, parameters, **kwargs)
-        # Operations that have result sets are not allowed with executemany.
         self._reset_state()
+        rowcount = 0
+        try:
+            for parameters in seq_of_parameters:
+                await self.execute(operation, parameters, **kwargs)
+                count = self.rowcount
+                rowcount = rowcount + count if rowcount >= 0 and count >= 0 else -1
+        except BaseException:
+            # Keep the query ID available for diagnostics and explicit cancellation.
+            self.close()
+            self.result_set = None
+            raise
+        self._reset_state()
+        self._rowcount = rowcount
 
     async def cancel(self) -> None:
         """Cancel the currently executing query.

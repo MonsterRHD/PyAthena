@@ -1,4 +1,5 @@
 import contextlib
+import uuid
 from io import BytesIO
 from pathlib import Path
 
@@ -135,6 +136,30 @@ def cursor(request):
     from pyathena.cursor import Cursor
 
     yield from _cursor(Cursor, request)
+
+
+@pytest.fixture
+def executemany_table(cursor):
+    """Isolate mutable DML data for each test and remove it on teardown.
+
+    Groups 1, 2, and 99 match two, one, and zero rows respectively.
+    Use a separate cursor so setup and teardown do not change the cursor under test.
+    """
+    table_name = f"executemany_{uuid.uuid4().hex}"
+    table = f"{ENV.schema}.{table_name}"
+    with cursor.connection.cursor() as table_cursor:
+        try:
+            table_cursor.execute(
+                f"""
+                CREATE TABLE {table} (id INT, group_id INT, value INT)
+                LOCATION '{ENV.s3_staging_dir}{ENV.schema}/{table_name}/'
+                TBLPROPERTIES ('table_type'='ICEBERG')
+                """
+            )
+            table_cursor.execute(f"INSERT INTO {table} VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30)")
+            yield table
+        finally:
+            table_cursor.execute(f"DROP TABLE IF EXISTS {table}")
 
 
 @pytest.fixture

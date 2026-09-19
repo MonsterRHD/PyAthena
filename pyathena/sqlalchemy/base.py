@@ -140,6 +140,8 @@ class AthenaDialect(DefaultDialect):
     supports_default_values: bool = False
     supports_empty_insert: bool = False
     supports_multivalues_insert: bool = True
+    supports_sane_rowcount: bool = True
+    supports_sane_multi_rowcount: bool = True
     supports_native_decimal: bool = True
     supports_native_boolean: bool = True
     supports_unicode_statements: bool | None = True

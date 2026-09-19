@@ -18,7 +18,7 @@ import pytest
 from pyathena import BINARY, BOOLEAN, DATE, DATETIME, JSON, NUMBER, STRING, TIME, ExecuteOptions
 from pyathena.converter import _to_array, _to_map, _to_struct
 from pyathena.cursor import Cursor
-from pyathena.error import DatabaseError, NotSupportedError, ProgrammingError
+from pyathena.error import DatabaseError, NotSupportedError, OperationalError, ProgrammingError
 from pyathena.model import AthenaQueryExecution
 from pyathena.util import RetryConfig
 from tests import ENV
@@ -796,13 +796,106 @@ class TestCursor:
             "INSERT INTO execute_many (a, b) VALUES (%(a)d, %(b)s)",
             [{"a": a, "b": b} for a, b in rows],
         )
-        # rowcount is not supported for executemany
-        assert cursor.rowcount == -1
+        assert cursor.rowcount == len(rows)
         cursor.execute("SELECT * FROM execute_many")
         assert sorted(cursor.fetchall()) == list(rows)
 
+    @pytest.mark.parametrize(
+        ("operation", "expected"),
+        [
+            pytest.param(
+                "INSERT INTO {table} SELECT id+10, group_id+10, value "
+                "FROM {table} WHERE group_id=%(group_id)d",
+                [(1, 10), (2, 20), (3, 30), (11, 10), (12, 20), (13, 30)],
+                id="insert",
+            ),
+            pytest.param(
+                "UPDATE {table} SET value=value+1 WHERE group_id=%(group_id)d",
+                [(1, 11), (2, 21), (3, 31)],
+                id="update",
+            ),
+            pytest.param("DELETE FROM {table} WHERE group_id=%(group_id)d", [], id="delete"),
+        ],
+    )
+    def test_executemany_rowcount(self, cursor, executemany_table, operation, expected):
+        operation = operation.format(table=executemany_table)
+        cursor.execute(f"SELECT id, value FROM {executemany_table} ORDER BY id")
+        previous = cursor.result_set
+        result = cursor.executemany(
+            operation,
+            [{"group_id": 1}, {"group_id": 2}, {"group_id": 99}],
+            work_group=ENV.default_work_group,
+        )
+        assert result is None
+        assert cursor.rowcount == 3
+        assert cursor.description is None
+        assert cursor.result_set is None
+        assert cursor.query_id is None
+        assert previous.is_closed
+
+        cursor.executemany(operation, [])
+        assert cursor.rowcount == 0
+        cursor.executemany(operation, [{"group_id": 99}, {"group_id": 100}])
+        assert cursor.rowcount == 0
+        cursor.close()
+        assert cursor.rowcount == -1
+
+        cursor.execute(f"SELECT id, value FROM {executemany_table} ORDER BY id")
+        assert cursor.rowcount == -1
+        assert cursor.fetchall() == expected
+
+    @pytest.mark.parametrize("failure_index", [0, 1])
+    def test_executemany_failure(self, cursor, executemany_table, failure_index):
+        operation = (
+            f"UPDATE {executemany_table} SET value=value+1 "
+            "WHERE group_id=CAST(%(group_id)s AS INTEGER)"
+        )
+        parameters = [{"group_id": "1"}] * failure_index + [
+            {"group_id": "invalid"},
+            {"group_id": "2"},
+        ]
+        with pytest.raises(OperationalError):
+            cursor.executemany(operation, parameters)
+        assert cursor.rowcount == -1
+        assert cursor.description is None
+        assert cursor.result_set is None
+        assert cursor.query_id
+
+        cursor.execute(f"SELECT id, value FROM {executemany_table} ORDER BY id")
+        assert cursor.fetchall() == [(1, 10 + failure_index), (2, 20 + failure_index), (3, 30)]
+        cursor.execute(operation, {"group_id": "2"})
+        assert cursor.rowcount == 1
+
+    def test_executemany_parameter_iteration_failure(self, cursor, executemany_table):
+        previous = None
+        query_id = None
+
+        def parameters():
+            nonlocal previous, query_id
+            yield {"group_id": 1}
+            previous = cursor.result_set
+            query_id = cursor.query_id
+            raise ValueError("invalid parameters")
+
+        with pytest.raises(ValueError, match="invalid parameters"):
+            cursor.executemany(
+                f"UPDATE {executemany_table} SET value=value+1 WHERE group_id=%(group_id)d",
+                parameters(),
+            )
+        assert cursor.rowcount == -1
+        assert cursor.result_set is None
+        assert query_id is not None
+        assert cursor.query_id == query_id
+        assert previous is not None
+        assert previous.is_closed
+        cursor.execute(f"SELECT id, value FROM {executemany_table} ORDER BY id")
+        assert cursor.fetchall() == [(1, 11), (2, 21), (3, 30)]
+
     def test_executemany_fetch(self, cursor):
+        cursor.executemany("SELECT %(x)d FROM one_row", [])
+        assert cursor.rowcount == 0
         cursor.executemany("SELECT %(x)d FROM one_row", [{"x": i} for i in range(1, 2)])
+        assert cursor.rowcount == -1
         # Operations that have result sets are not allowed with executemany.
         pytest.raises(ProgrammingError, cursor.fetchall)
         pytest.raises(ProgrammingError, cursor.fetchmany)
