@@ -572,11 +572,10 @@ class AthenaPandasResultSet(AthenaResultSet):
         try:
             source: str | TextIOWrapper = self.output_location
             description = self.description if self.description else []
-            converters = dict(read_csv_kwargs.get("converters") or {})
             binary_columns = {
                 i
                 for i, d in enumerate(description)
-                if d[1] == "varbinary" and (d[0] in converters or i in converters)
+                if d[1] == "varbinary" and d[1] in self._converter.mappings
             }
             if (
                 binary_columns
@@ -584,6 +583,8 @@ class AthenaPandasResultSet(AthenaResultSet):
                 and self.output_location.endswith(".csv")
                 and read_csv_kwargs.get("header") == 0
                 and read_csv_kwargs.get("skiprows") is None
+                and read_csv_kwargs.get("quoting") != csv.QUOTE_NONE
+                and read_csv_kwargs.get("quotechar", '"') == '"'
             ):
                 # Let pandas resolve duplicate names and aliases using its own header parser.
                 header_buffer = StringIO()
