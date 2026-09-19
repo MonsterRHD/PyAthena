@@ -1,7 +1,10 @@
+import logging
+
 import pytest
-from sqlalchemy import Integer, String, inspect, select
+from sqlalchemy import CHAR, VARCHAR, Integer, String, inspect, select
 from sqlalchemy import exc as sa_exc
 from sqlalchemy import testing as sa_testing
+from sqlalchemy.sql.elements import quoted_name
 from sqlalchemy.testing import fixtures
 from sqlalchemy.testing.schema import Column, Table
 from sqlalchemy.testing.suite import *  # noqa: F403
@@ -84,6 +87,21 @@ class ComponentReflectionTest(_ComponentReflectionTest):
 
 
 class ComponentReflectionTestExtra(_ComponentReflectionTestExtra):
+    @sa_testing.combinations((String, None), (VARCHAR, 52), (CHAR, 52), argnames="type_,length")
+    def test_hive_string_length_reflection(self, connection, metadata, type_, length):
+        table = Table(
+            "string_length",
+            metadata,
+            Column("data", type_(52)),
+            awsathena_tblproperties={"classification": "parquet"},
+            awsathena_file_format="PARQUET",
+        )
+        table.create(connection)
+        reflected_type = inspect(connection).get_columns(table.name)[0]["type"]
+        assert isinstance(reflected_type, type_)
+        # Generic String compiles to Hive STRING without a length constraint.
+        assert reflected_type.length == length
+
     def test_hive_comments_unicode(self, connection, metadata):
         table = Table(
             "unicode_comments",
@@ -122,7 +140,15 @@ class LongNameBlowoutTest(_LongNameBlowoutTest):
         argnames="type_",
     )
     def test_long_convention_name(self, type_, metadata, connection):
-        super().test_long_convention_name(type_, metadata, connection)
+        # Reuse the upstream fixtures without calling its parametrized wrapper.
+        actual_name, reflected_name = getattr(self, type_)(metadata, connection)
+        assert len(actual_name) > 255
+        if reflected_name is not None:
+            overlap = actual_name[: len(reflected_name)]
+            if len(overlap) < len(actual_name):
+                assert overlap[:-5] == reflected_name[:-5]
+            else:
+                assert overlap == reflected_name
 
 
 class HasTableTest(_HasTableTest):
@@ -191,14 +217,16 @@ class IdentifierReflectionTest(fixtures.TestBase):
         assert inspector.get_table_options(table.name)["awsathena_location"]
 
     @sa_testing.combinations(128, 129, 255, argnames="length")
-    def test_identifier_length(self, connection, metadata, length):
+    def test_identifier_length(self, connection, metadata, caplog, length):
         table = Table("t" * length, metadata, Column("c" * 255, Integer))
         inspector = inspect(connection)
         assert not inspector.has_table(table.name)
         missing_schema = f"{sa_testing.config.test_schema}_missing"
+        caplog.clear()
         assert not inspector.has_table(table.name, schema=missing_schema)
         with pytest.raises(sa_exc.NoSuchTableError):
             inspector.get_columns(table.name, schema=missing_schema)
+        assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
         table.create(connection)
         connection.execute(table.insert().values({"c" * 255: 1}))
         assert connection.execute(select(table)).scalar_one() == 1
@@ -206,6 +234,9 @@ class IdentifierReflectionTest(fixtures.TestBase):
         inspector.clear_cache()
         assert inspector.has_table(table.name)
         assert inspector.get_columns(table.name)[0]["name"] == "c" * 255
+        uppercase_name = quoted_name(str(table.name).upper(), quote=True)
+        assert inspector.has_table(uppercase_name)
+        assert inspector.get_columns(uppercase_name)[0]["name"] == "c" * 255
         table.drop(connection)
         assert inspector.has_table(table.name)
         inspector.clear_cache()

@@ -322,6 +322,7 @@ class AioBaseCursor(BaseCursor):
         expression: str | None = None,
         next_token: str | None = None,
         max_results: int | None = None,
+        logging_: bool = True,
     ) -> tuple[str | None, list[AthenaTableMetadata]]:
         request = self._build_list_table_metadata_request(
             catalog_name=catalog_name,
@@ -338,7 +339,8 @@ class AioBaseCursor(BaseCursor):
                 **request,
             )
         except Exception as e:
-            _logger.exception("Failed to list table metadata.")
+            if logging_:
+                _logger.exception("Failed to list table metadata.")
             raise OperationalError(*e.args) from e
         else:
             return response.get("NextToken"), [
@@ -352,6 +354,7 @@ class AioBaseCursor(BaseCursor):
         schema_name: str | None = None,
         expression: str | None = None,
         max_results: int | None = None,
+        logging_: bool = True,
     ) -> list[AthenaTableMetadata]:
         metadata: list[AthenaTableMetadata] = []
         next_token = None
@@ -362,6 +365,7 @@ class AioBaseCursor(BaseCursor):
                 expression=expression,
                 next_token=next_token,
                 max_results=max_results,
+                logging_=logging_,
             )
             metadata.extend(response)
             if not next_token:

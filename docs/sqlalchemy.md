@@ -80,7 +80,9 @@ Athena does not support primary key, foreign key, unique, or index constraints.
 Its `CREATE TABLE` syntax does not enforce `nullable=False`, and reflected columns report `nullable=True` and `autoincrement=False`.
 Iceberg strings do not preserve `CHAR` or `VARCHAR` length constraints; `CHAR` is not a supported Iceberg type.
 See the [Iceberg data type documentation](https://docs.aws.amazon.com/athena/latest/ug/querying-iceberg-supported-data-types.html).
+Hive preserves explicit `CHAR(n)` and `VARCHAR(n)` lengths; SQLAlchemy's generic `String` compiles to unbounded `STRING`.
 Table comments returned by Athena metadata can have whitespace and line breaks normalized.
+Glue rejects line breaks in Hive column comments.
 Athena does not persist the table-level `COMMENT` when creating an Iceberg table, so its reflected table comment is `None`; column comments are preserved.
 
 SQLAlchemy's Inspector caches reflection results, including both positive and negative `has_table()` results.

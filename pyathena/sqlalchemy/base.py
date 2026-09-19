@@ -273,8 +273,16 @@ class AthenaDialect(DefaultDialect):
                 # GetTableMetadata limits table names to 128 characters, while
                 # Athena SQL and ListTableMetadata support longer table names.
                 if len(table_name) > 128:
-                    for metadata in self._get_tables(connection, schema, **kw):
-                        if metadata.name == table_name:
+                    name = str(table_name).lower()
+                    expression = re.escape(name)
+                    # ListTableMetadata limits its regex filter to 256 characters.
+                    # Unusual catalog names can exceed that after regex escaping.
+                    for metadata in cursor.list_table_metadata(
+                        schema_name=schema,
+                        expression=expression if len(expression) <= 256 else None,
+                        logging_=False,
+                    ):
+                        if metadata.name == name:
                             return metadata
                     raise exc.NoSuchTableError(table_name)
                 return cursor.get_table_metadata(table_name, schema_name=schema, logging_=False)
