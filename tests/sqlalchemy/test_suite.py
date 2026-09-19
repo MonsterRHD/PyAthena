@@ -200,7 +200,7 @@ class NativeArrayTest(fixtures.TestBase):
                 [{"name": "a,b", "n": 2}, None],
             ),
             (AthenaArray(Integer, as_tuple=True), (1, None, 3)),
-            (AthenaArray(types.JSON), [{"n": 1, "s": "a,b"}, [1, None], None]),
+            (AthenaArray(types.JSON), [{"n": 1, "s": "a,b", "fraction": 0.1}, [1, None], None]),
         ]
         expressions = [
             literal(value, type_=type_, literal_execute=literal_execute).label(f"v{index}")

@@ -237,6 +237,35 @@ class TestAthenaDialect:
 class TestSQLAlchemyAthena:
     @pytest.mark.parametrize(
         "engine",
+        [{"driver": driver} for driver in ("rest", "pandas", "arrow", "polars", "s3fs")],
+        indirect=True,
+    )
+    def test_native_array_results_across_cursors(self, engine):
+        engine, _ = engine
+        modes = (
+            (False, True) if engine.dialect.driver in ("pandas", "arrow", "polars") else (False,)
+        )
+        for unload in modes:
+            url = engine.url.update_query_dict({"unload": str(unload).lower()})
+            array_engine = sqlalchemy.create_engine(url)
+            try:
+                with array_engine.connect() as conn:
+                    result = conn.execute(
+                        select(
+                            sqlalchemy.literal(
+                                [["001", "a,b", "null", ""], [], None],
+                                AthenaArray(types.String, dimensions=2),
+                            ).label("nested"),
+                            sqlalchemy.literal([], AthenaArray(types.Integer)).label("empty"),
+                            sqlalchemy.literal(None, AthenaArray(types.Integer)).label("missing"),
+                        )
+                    ).one()
+                    assert tuple(result) == ([["001", "a,b", "null", ""], [], None], [], None)
+            finally:
+                array_engine.dispose()
+
+    @pytest.mark.parametrize(
+        "engine",
         [
             {"driver": "rest"},
             {"driver": "pandas"},

@@ -309,6 +309,7 @@ def test_array_insert_uses_typed_parameter():
         ),
         (AthenaArray(types.Date), '["2025-01-02"]', [date(2025, 1, 2)]),
         (AthenaArray(types.BINARY), '["00FF",""]', [b"\x00\xff", b""]),
+        (AthenaArray(types.JSON), '[{"fraction":0.1}]', [{"fraction": 0.1}]),
         (
             AthenaArray(AthenaMap(Integer, String)),
             '[[["1","001"],["2",null]]]',
@@ -325,6 +326,8 @@ def test_array_result_conversion(type_, encoded, expected):
     processor = type_.result_processor(AthenaDialect(), None)
     assert processor(encoded) == expected
     assert processor(json.loads(encoded)) == expected
+    assert processor(json.dumps({"_pyathena_array": json.loads(encoded)})) == expected
+    assert processor('{"_pyathena_array":null}') is None
     assert processor(None) is None
 
 
