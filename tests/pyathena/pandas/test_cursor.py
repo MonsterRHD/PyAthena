@@ -1,4 +1,5 @@
 import contextlib
+import csv
 import math
 import random
 import string
@@ -105,6 +106,19 @@ class TestPandasCursor:
     def test_binary_custom_quoting(self, pandas_cursor, read_options):
         pandas_cursor.execute("SELECT X'00ff' AS value", **read_options)
         assert pandas_cursor.as_pandas().iloc[0].tolist() == ['"00 ff"']
+
+    @pytest.mark.parametrize("engine", ["c", "python"])
+    def test_binary_custom_dialect(self, pandas_cursor, engine):
+        dialect = csv.excel()
+        dialect.quoting = csv.QUOTE_NONE
+        pandas_cursor.execute(
+            "SELECT CAST(NULL AS VARBINARY) AS value, 'text' AS label",
+            engine=engine,
+            dialect=dialect,
+        )
+        row = pandas_cursor.as_pandas().iloc[0].tolist()
+        assert pd.isna(row[0])
+        assert row[1] == '"text"'
 
     def test_binary_duplicate_name_without_converter(self):
         converter = DefaultPandasTypeConverter()

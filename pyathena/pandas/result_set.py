@@ -583,6 +583,7 @@ class AthenaPandasResultSet(AthenaResultSet):
                 and self.output_location.endswith(".csv")
                 and read_csv_kwargs.get("header") == 0
                 and read_csv_kwargs.get("skiprows") is None
+                and read_csv_kwargs.get("dialect") is None
                 and read_csv_kwargs.get("quoting") != csv.QUOTE_NONE
                 and read_csv_kwargs.get("quotechar", '"') == '"'
             ):
