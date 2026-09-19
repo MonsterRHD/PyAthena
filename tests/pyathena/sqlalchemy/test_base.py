@@ -2069,6 +2069,7 @@ OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
         )
 
         try:
+            assert not sqlalchemy.inspect(conn).has_table(table_name, schema=schema)
             table.create(bind=conn)
             actual = Table(table_name, MetaData(schema=schema), autoload_with=conn)
             tblproperties = actual.dialect_options["awsathena"]["tblproperties"]

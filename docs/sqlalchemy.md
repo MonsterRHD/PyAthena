@@ -99,7 +99,7 @@ A later listing preserves metadata already fetched for a table.
 
 Table-metadata lookups propagate throttling and permission errors rather than reporting missing tables.
 `has_table()` propagates these failures, including access denied by Lake Formation, instead of returning or caching `False`.
-Only recognized `EntityNotFoundException` responses establish absence; unrecognized metadata errors are propagated rather than guessed to mean a missing table.
+For failed metadata requests, only recognized `EntityNotFoundException` responses establish absence; unrecognized errors are propagated rather than guessed to mean a missing table.
 PyAthena recognizes Glue error codes in Athena's `MetadataException` service-error envelope and applies `RetryConfig.exceptions` to those codes.
 `RetryConfig` accepts one exception-name string or an iterable and captures the names as a tuple at construction.
 Changes to the original input list or iterator no longer change the stored policy; construct a new `RetryConfig` when changing the retry policy.

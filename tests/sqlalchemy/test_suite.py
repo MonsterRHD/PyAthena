@@ -1,6 +1,7 @@
 import logging
 
 import pytest
+from botocore.exceptions import ClientError
 from sqlalchemy import CHAR, VARCHAR, Integer, String, func, inspect, select
 from sqlalchemy import exc as sa_exc
 from sqlalchemy import testing as sa_testing
@@ -18,6 +19,8 @@ from sqlalchemy.testing.suite import LongNameBlowoutTest as _LongNameBlowoutTest
 from sqlalchemy.testing.suite import QuotedNameArgumentTest as _QuotedNameArgumentTest
 from sqlalchemy.testing.suite import SimpleUpdateDeleteTest as _SimpleUpdateDeleteTest
 from sqlalchemy.testing.suite import StringTest as _StringTest
+
+from pyathena.error import OperationalError
 
 del BinaryTest  # noqa: F821
 del CompositeKeyReflectionTest  # noqa: F821
@@ -261,6 +264,35 @@ class LongNameBlowoutTest(_LongNameBlowoutTest):
 
 
 class HasTableTest(_HasTableTest):
+    @sa_testing.combinations("AccessDeniedException", "ThrottlingException", None, argnames="code")
+    def test_metadata_errors_do_not_establish_absence(self, connection, monkeypatch, code):
+        raw_connection = connection.connection.driver_connection
+        if connection.dialect.is_async:
+            raw_connection = raw_connection.driver_connection
+        message = (
+            "Catalog error (Service: AmazonDataCatalog; Status Code: 400; "
+            f"Error Code: {code}; Request ID: example; Proxy: null)"
+            if code
+            else "Table not found"
+        )
+        error = ClientError(
+            {"Error": {"Code": "MetadataException", "Message": message}}, "GetTableMetadata"
+        )
+        calls = []
+
+        def fail_metadata(**kwargs):
+            calls.append(kwargs)
+            raise error
+
+        monkeypatch.setattr(raw_connection.client, "get_table_metadata", fail_metadata)
+        monkeypatch.setattr(raw_connection.retry_config, "attempt", 1)
+        inspector = inspect(connection)
+        for _ in range(2):
+            with pytest.raises(OperationalError) as caught:
+                inspector.has_table("unavailable_metadata")
+            assert caught.value.__cause__ is error
+        assert len(calls) == 2
+
     @sa_testing.combinations((True, sa_testing.requires.schemas), False, argnames="use_schema")
     def test_has_table_cache_drop(self, connection, metadata, use_schema):
         schema = sa_testing.config.test_schema if use_schema else None
