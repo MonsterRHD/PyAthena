@@ -436,7 +436,7 @@ def test_untyped_array_preserves_json_scalar_types():
     dialect = AthenaDialect()
     untyped = AthenaArray(types.NullType())
     sql = str(select(Column("items", untyped)).compile(dialect=dialect))
-    assert "CAST(_pyathena_array_0 AS JSON)" in sql
+    assert "json_format" not in sql
     assert untyped.result_processor(dialect, None)('[1,{"x":2},[3]]') == [1, {"x": 2}, [3]]
     with pytest.raises(sa_exc.CompileError, match="explicit element type"):
         select(literal([1], untyped)).compile(dialect=dialect)
@@ -451,3 +451,58 @@ def test_array_textual_ordering_and_hive_field_spaces():
     reflected = AthenaDialect()._get_column_type("array<struct<first name:string>>")
     assert list(reflected.item_type.fields) == ["first name"]
     assert isinstance(reflected.item_type.fields["first name"], String)
+
+
+class DecoratedTimestamp(types.TypeDecorator):
+    impl = types.TIMESTAMP
+    cache_ok = True
+
+    def process_result_value(self, value, dialect):
+        assert value is None or isinstance(value, datetime)
+        return value
+
+
+class JSONEncodedDict(types.TypeDecorator):
+    impl = String
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        return json.dumps(value)
+
+    def process_result_value(self, value, dialect):
+        return json.loads(value)
+
+
+@pytest.mark.parametrize(
+    ("item_type", "value"),
+    [
+        (DecoratedTimestamp(), datetime(2025, 1, 2, 3, 4, 5)),
+        (JSONEncodedDict(), {"x": 1}),
+        (OffsetInteger().with_variant(String(), "awsathena"), "unchanged"),
+    ],
+)
+def test_decorator_bind_literal_and_result_paths(item_type, value):
+    dialect = AthenaDialect()
+    array = AthenaArray(item_type)
+    bind = array.bind_processor(dialect)([value])
+    rendered = DefaultParameterFormatter().format("SELECT %(value)s", {"value": bind})
+    assert "ARRAY[" in rendered
+    literal_sql = array.literal_processor(dialect)([value])
+    assert "ARRAY[" in literal_sql
+    select(literal([value], array)).compile(dialect=dialect)
+    encoded = (
+        value.isoformat(" ")
+        if isinstance(value, datetime)
+        else (json.dumps(value) if isinstance(value, dict) else value)
+    )
+    assert array.result_processor(dialect, None)(json.dumps([encoded])) == [value]
+
+
+def test_textual_ordering_list_and_unresolved_expression():
+    table = Table(
+        "arrays", MetaData(), Column("id", Integer), Column("items", AthenaArray(Integer))
+    )
+    sql = str(select(table).order_by(text("items DESC, id")).compile(dialect=AthenaDialect()))
+    assert "ORDER BY anon_1.items DESC, anon_1.id" in sql
+    with pytest.raises(sa_exc.CompileError, match="column expressions"):
+        select(table).order_by(text("cardinality(items)")).compile(dialect=AthenaDialect())

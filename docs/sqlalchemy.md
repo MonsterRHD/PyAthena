@@ -1041,6 +1041,9 @@ Ordinary DB API list and tuple parameters retain their existing `IN (...)` forma
 Typed SQLAlchemy SELECT expressions use a JSON transport projection to preserve nested values and strings containing commas, quotes, whitespace, or the word `null`.
 Scalar leaves are decoded according to the declared type, preserving decimal precision, dates, timestamps, and binary values.
 SQL predicates and intermediate subqueries still operate on native arrays.
+Arrays with unknown (`NullType`) elements keep the cursor's native conversion instead of using typed transport.
+For ordered typed ARRAY results, use SQLAlchemy column expressions.
+Textual ORDER BY clauses may name selected columns (including comma-separated names and direction/null placement); other textual expressions raise a compilation error to prevent ordering serialized values or referring to columns outside their scope.
 Raw `text()` queries and direct DB API queries retain the cursor's existing conversion behavior described below; they do not receive this projection automatically.
 
 Compared with earlier releases, reflected ARRAY columns are no longer reported as `String`.

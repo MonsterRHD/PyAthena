@@ -33,8 +33,10 @@ from pyathena.sqlalchemy.types import (
     AthenaMap,
     AthenaStruct,
     _array_item_type,
+    _decorator_impl,
     get_double_type,
 )
+from pyathena.sqlalchemy.util import _split_type_arguments
 
 if TYPE_CHECKING:
     from sqlalchemy import (
@@ -292,7 +294,14 @@ class AthenaStatementCompiler(SQLCompiler):
                 return element.element
             return None
 
-        for clause in statement._order_by_clauses:
+        clauses = [
+            TextClause(part) if isinstance(clause, TextClause) else clause
+            for clause in statement._order_by_clauses
+            for part in (
+                _split_type_arguments(clause.text) if isinstance(clause, TextClause) else [""]
+            )
+        ]
+        for clause in clauses:
             if isinstance(clause, TextClause):
                 match = re.fullmatch(
                     r'\s*("(?:[^"]|"")+"|[\w]+)(?:\s+(ASC|DESC))?(?:\s+NULLS\s+(FIRST|LAST))?\s*',
@@ -302,6 +311,8 @@ class AthenaStatementCompiler(SQLCompiler):
                 if match:
                     name, direction, nulls = match.groups()
                     name = name[1:-1].replace('""', '"') if name.startswith('"') else name
+                    if name.isdigit() and 1 <= int(name) <= len(columns):
+                        name = columns[int(name) - 1].key
                     if name in statement.selected_columns:
                         clause = statement.selected_columns[name]
                         if direction:
@@ -312,6 +323,11 @@ class AthenaStatementCompiler(SQLCompiler):
                                 if nulls.upper() == "FIRST"
                                 else clause.nulls_last()
                             )
+                if isinstance(clause, TextClause):
+                    raise exc.CompileError(
+                        "Textual ARRAY ordering must name selected columns; "
+                        "use SQLAlchemy column expressions for other ordering"
+                    )
             clause = visitors.replacement_traverse(clause, {}, resolve_label)
             modifiers = []
             while isinstance(clause, UnaryExpression) and clause.modifier in (
@@ -437,9 +453,7 @@ class AthenaStatementCompiler(SQLCompiler):
 
     def _complex_dml_type(self, type_):
         if isinstance(type_, types.TypeDecorator):
-            implementation = type_.dialect_impl(self.dialect)
-            assert isinstance(implementation, types.TypeDecorator)
-            return self._complex_dml_type(implementation.impl_instance)
+            return self._complex_dml_type(_decorator_impl(type_, self.dialect))
         if isinstance(type_, types.NullType):
             raise exc.CompileError("Bound ARRAY values require an explicit element type")
         if isinstance(type_, types.ARRAY):
@@ -473,9 +487,7 @@ class AthenaStatementCompiler(SQLCompiler):
 
     def _array_json(self, value, type_, depth=0):
         if isinstance(type_, types.TypeDecorator):
-            implementation = type_.dialect_impl(self.dialect)
-            assert isinstance(implementation, types.TypeDecorator)
-            return self._array_json(value, implementation.impl_instance, depth)
+            return self._array_json(value, _decorator_impl(type_, self.dialect), depth)
         # Each recursive value becomes JSON, including map keys and typed scalar leaves.
         variable = f"_pyathena_array_{depth}"
         if isinstance(type_, types.ARRAY):

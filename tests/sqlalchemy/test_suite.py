@@ -1,3 +1,4 @@
+import json as _json
 import logging
 from datetime import date
 from datetime import datetime as _datetime
@@ -121,6 +122,26 @@ class CTETest(_CTETest):
         metadata.tables["some_table"].c.parent_id.type = Integer()
 
 
+class _ArrayTimestamp(types.TypeDecorator):
+    impl = types.TIMESTAMP
+    cache_ok = True
+
+    def process_result_value(self, value, dialect):
+        assert value is None or isinstance(value, _datetime)
+        return value
+
+
+class _ArrayJSONText(types.TypeDecorator):
+    impl = String
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        return _json.dumps(value)
+
+    def process_result_value(self, value, dialect):
+        return _json.loads(value)
+
+
 class NativeArrayTest(fixtures.TestBase):
     __backend__ = True
     __requires__ = ("array_type",)
@@ -152,6 +173,10 @@ class NativeArrayTest(fixtures.TestBase):
             .order_by("value")
         )
         eq_(connection.execute(union).scalars().all(), [[2], [10]])
+        eq_(
+            connection.execute(select(value, table.c.id).order_by(text("items DESC, id"))).all(),
+            [([10], 1), ([2], 2), ([2], 3)],
+        )
 
     def test_review_regressions(self, connection):
         expressions = [
@@ -166,6 +191,18 @@ class NativeArrayTest(fixtures.TestBase):
             (["a-very-long-string"], [0.1], [0.1]),
         )
         eq_(connection.execute(select(expressions[3])).scalar_one(), [3])
+        custom_values = [
+            (AthenaArray(_ArrayTimestamp()), [_datetime(2025, 1, 2, 3, 4, 5)]),
+            (AthenaArray(_ArrayJSONText()), [{"nested": [1, 2], "fraction": 0.1}]),
+        ]
+        for type_, value in custom_values:
+            for literal_execute in (False, True):
+                eq_(
+                    connection.execute(
+                        select(literal(value, type_, literal_execute=literal_execute))
+                    ).scalar_one(),
+                    value,
+                )
 
     def test_reflection_and_executemany(self, connection, metadata):
         table = Table(
