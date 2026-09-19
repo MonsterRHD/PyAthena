@@ -347,6 +347,19 @@ class AthenaArray(sqltypes.ARRAY[Any]):
         return process
 
 
+class _ArraySliceStepType(types.TypeDecorator[int]):
+    impl = types.Integer
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if type(value) is not int or value != 1:
+            raise ValueError("Athena ARRAY slices support only step=None or step=1")
+        return value
+
+    def process_literal_param(self, value, dialect):
+        return self.process_bind_param(value, dialect)
+
+
 class ARRAY(AthenaArray):
     """Uppercase alias for AthenaArray type."""
 
