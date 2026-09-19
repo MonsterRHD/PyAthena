@@ -1,9 +1,11 @@
 import json
 from datetime import date, datetime
 from decimal import Decimal
+from enum import Enum
 
 import pytest
-from sqlalchemy import Column, Integer, MetaData, String, Table, cast, literal, select, types
+from sqlalchemy import Column, Integer, MetaData, String, Table, cast, literal, select, text, types
+from sqlalchemy import exc as sa_exc
 from sqlalchemy.sql import sqltypes
 
 import pyathena
@@ -179,7 +181,7 @@ def test_get_double_type():
     [
         (types.ARRAY(Integer), "ARRAY<INT>", "ARRAY(INTEGER)"),
         (AthenaArray(), "ARRAY<STRING>", "ARRAY(VARCHAR)"),
-        (ARRAY(String(12)), "ARRAY<STRING>", "ARRAY(VARCHAR(12))"),
+        (ARRAY(String(12)), "ARRAY<STRING>", "ARRAY(VARCHAR)"),
         (types.ARRAY(String, dimensions=2), "ARRAY<ARRAY<STRING>>", "ARRAY(ARRAY(VARCHAR))"),
         (AthenaArray(AthenaArray(Integer)), "ARRAY<ARRAY<INT>>", "ARRAY(ARRAY(INTEGER))"),
         (AthenaArray(types.Numeric(12, 3)), "ARRAY<DECIMAL(12, 3)>", "ARRAY(DECIMAL(12, 3))"),
@@ -397,3 +399,55 @@ class TestAthenaTimestamp:
             AthenaTimestamp.process("2017-01-01 12:34:56.789")
             == "TIMESTAMP '2017-01-01 12:34:56.789'"
         )
+
+
+class Color(Enum):
+    RED = "red"
+
+
+class OffsetInteger(types.TypeDecorator):
+    impl = Integer
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        return value - 1 if value is not None else None
+
+    def process_result_value(self, value, dialect):
+        return value + 1 if value is not None else None
+
+
+@pytest.mark.parametrize("item_type", [types.Double, types.DOUBLE, types.DOUBLE_PRECISION])
+def test_array_double_precision_cast(item_type):
+    sql = str(cast(literal(None), AthenaArray(item_type)).compile(dialect=AthenaDialect()))
+    assert "AS ARRAY(DOUBLE)" in sql
+
+
+def test_array_custom_element_processors():
+    dialect = AthenaDialect()
+    enum = AthenaArray(types.Enum(Color))
+    assert enum.result_processor(dialect, None)('["RED"]') == [Color.RED]
+    decorated = AthenaArray(OffsetInteger())
+    assert decorated.result_processor(dialect, None)('["4"]') == [5]
+    sql = str(select(literal([5], decorated)).compile(dialect=dialect))
+    assert "ARRAY(INTEGER)" in sql
+
+
+def test_untyped_array_preserves_json_scalar_types():
+    dialect = AthenaDialect()
+    untyped = AthenaArray(types.NullType())
+    sql = str(select(Column("items", untyped)).compile(dialect=dialect))
+    assert "CAST(_pyathena_array_0 AS JSON)" in sql
+    assert untyped.result_processor(dialect, None)('[1,{"x":2},[3]]') == [1, {"x": 2}, [3]]
+    with pytest.raises(sa_exc.CompileError, match="explicit element type"):
+        select(literal([1], untyped)).compile(dialect=dialect)
+
+
+def test_array_textual_ordering_and_hive_field_spaces():
+    table = Table(
+        "arrays", MetaData(), Column("id", Integer), Column("items", AthenaArray(Integer))
+    )
+    sql = str(select(table).order_by(text("id DESC")).compile(dialect=AthenaDialect()))
+    assert "ORDER BY anon_1.id DESC" in sql
+    reflected = AthenaDialect()._get_column_type("array<struct<first name:string>>")
+    assert list(reflected.item_type.fields) == ["first name"]
+    assert isinstance(reflected.item_type.fields["first name"], String)
