@@ -82,6 +82,25 @@ class TestPandasCursor:
             )
             assert cursor.fetchone() == ("00 ff", "x" * 200)
 
+    @pytest.mark.parametrize("engine", ["c", "python"])
+    @pytest.mark.parametrize(
+        ("read_options", "expected"),
+        [
+            ({}, [None, b"", b"\x00\xff"]),
+            ({"names": ["null_value", "empty_value", "value"]}, [None, b"", b"\x00\xff"]),
+            ({"usecols": [1, 2]}, [b"", b"\x00\xff"]),
+            ({"names": [0, 1, 2], "usecols": [1, 2]}, [b"", b"\x00\xff"]),
+        ],
+        ids=["duplicate_names", "renamed", "selected", "integer_names_selected"],
+    )
+    def test_binary_dataframe_column_names(self, pandas_cursor, engine, read_options, expected):
+        pandas_cursor.execute(
+            "SELECT CAST(NULL AS VARBINARY) AS value, X'' AS value, X'00ff' AS value",
+            engine=engine,
+            **read_options,
+        )
+        assert pandas_cursor.as_pandas().iloc[0].tolist() == expected
+
     def test_binary_single_null(self, pandas_cursor):
         pandas_cursor.execute("SELECT CAST(NULL AS VARBINARY) AS value")
         assert pandas_cursor.fetchall() == [(None,)]

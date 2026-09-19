@@ -63,7 +63,7 @@ which correctly interprets unquoted empty values as NULL, while `S3FSCursor` use
 ## Binary Values
 
 The string comparison above does not apply to `VARBINARY` columns.
-With the default converters, pandas and Arrow cursors distinguish SQL NULL from empty binary
+With the default CSV settings and converters, pandas and Arrow cursors distinguish SQL NULL from empty binary
 values when reading CSV results: `fetchone()`, `fetchmany()`, and `fetchall()` return `None`
 for NULL and `b''` for an empty binary value.
 This also applies to their asynchronous variants and pandas chunked reads.
