@@ -34,6 +34,7 @@ class TestPandasCursor:
                 ) AS t(id, value, label, text_value) ORDER BY id"""
         pandas_cursor.execute(query, engine=engine, chunksize=chunksize)
         rows = pandas_cursor.fetchall()
+        assert pandas_cursor.result_set._csv_stream.closed
         assert [row[:3] for row in rows] == [
             (1, None, "null"),
             (2, b"", "empty"),
@@ -55,6 +56,82 @@ class TestPandasCursor:
         result = pandas_cursor.as_pandas()
         df = pd.concat(list(result), ignore_index=True) if chunksize else result
         assert df["value"].tolist() == [None, b"", b"\x00\xff"]
+        assert pandas_cursor.result_set._csv_stream.closed
+
+    @pytest.mark.parametrize("engine", ["c", "python"])
+    @pytest.mark.parametrize(
+        "close_method",
+        ["iterator", "generator", "context", "exhaust", "nrows", "get_chunk", "cursor", "execute"],
+    )
+    def test_binary_csv_stream_close(self, pandas_cursor, engine, close_method):
+        pandas_cursor.execute(
+            "SELECT X'00' AS value, rpad('x', 4096, 'x') AS padding "
+            "FROM UNNEST(sequence(1, 100)) AS t(id)",
+            engine=engine,
+            chunksize=1,
+            nrows=2 if close_method == "nrows" else None,
+        )
+        stream = pandas_cursor.result_set._csv_stream
+        source = stream.buffer.raw._reader._file
+        dataframe_iterator = pandas_cursor.as_pandas()
+        chunks = pandas_cursor.iter_chunks() if close_method == "generator" else dataframe_iterator
+        assert next(chunks)["value"].tolist() == [b"\x00"]
+        assert not stream.closed
+        assert not source.closed
+
+        if close_method in ("iterator", "generator"):
+            chunks.close()
+        elif close_method == "context":
+            with chunks:
+                assert next(chunks)["value"].tolist() == [b"\x00"]
+        elif close_method == "exhaust":
+            assert sum(len(chunk) for chunk in chunks) == 99
+        elif close_method == "nrows":
+            assert sum(len(chunk) for chunk in chunks) == 1
+        elif close_method == "get_chunk":
+            assert len(chunks.get_chunk(99)) == 99
+            with pytest.raises(StopIteration):
+                chunks.get_chunk(1)
+        elif close_method == "cursor":
+            pandas_cursor.close()
+        else:
+            pandas_cursor.execute("SELECT 1")
+
+        assert stream.closed
+        assert source.closed
+        chunks.close()
+        with pytest.raises(StopIteration):
+            next(dataframe_iterator)
+        with pytest.raises(StopIteration):
+            dataframe_iterator.get_chunk()
+        if close_method != "execute":
+            assert pandas_cursor.fetchone() is None
+
+    @pytest.mark.parametrize("engine", ["c", "python"])
+    @pytest.mark.parametrize("read_method", ["next", "get_chunk"])
+    def test_binary_csv_stream_close_on_read_error(self, pandas_cursor, engine, read_method):
+        pandas_cursor.execute(
+            "SELECT X'00' AS value, rpad('x', 4096, 'x') AS padding "
+            "FROM UNNEST(sequence(1, 100)) AS t(id)",
+            engine=engine,
+            chunksize=1,
+            dtype={"padding": "int64"},
+        )
+        stream = pandas_cursor.result_set._csv_stream
+        source = stream.buffer.raw._reader._file
+        chunks = pandas_cursor.as_pandas()
+        assert not stream.closed
+        assert not source.closed
+        read_chunk = chunks.__next__ if read_method == "next" else chunks.get_chunk
+        with pytest.raises(ValueError, match=r"invalid literal|Unable to convert column"):
+            read_chunk()
+        assert stream.closed
+        assert source.closed
+        with pytest.raises(StopIteration):
+            next(chunks)
+        with pytest.raises(StopIteration):
+            chunks.get_chunk()
+        assert pandas_cursor.fetchone() is None
 
     def test_binary_converter_override(self, pandas_cursor):
         pandas_cursor.execute(

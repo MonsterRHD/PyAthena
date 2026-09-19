@@ -4,6 +4,7 @@ import csv
 import logging
 from collections import abc
 from collections.abc import Callable, Iterable, Iterator
+from contextlib import ExitStack
 from functools import partial
 from io import BufferedReader, StringIO, TextIOWrapper
 from multiprocessing import cpu_count
@@ -69,12 +70,14 @@ class PandasDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
         self,
         reader: TextFileReader | DataFrame,
         trunc_date: Callable[[DataFrame], DataFrame],
+        csv_stream: TextIOWrapper | None = None,
     ) -> None:
         """Initialize the iterator.
 
         Args:
             reader: Either a TextFileReader (for chunked) or a single DataFrame.
             trunc_date: Function to apply date truncation to each chunk.
+            csv_stream: Optional CSV stream owned and closed by this iterator.
         """
         from pandas import DataFrame
 
@@ -83,6 +86,7 @@ class PandasDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
         else:
             self._reader = reader
         self._trunc_date = trunc_date
+        self._csv_stream = csv_stream
 
     def __next__(self) -> DataFrame:
         """Get the next DataFrame chunk.
@@ -96,7 +100,7 @@ class PandasDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
         try:
             df = next(self._reader)
             return self._trunc_date(df)
-        except StopIteration:
+        except BaseException:
             self.close()
             raise
 
@@ -116,8 +120,14 @@ class PandasDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
         """Close the iterator and release resources."""
         from pandas.io.parsers import TextFileReader
 
-        if isinstance(self._reader, TextFileReader):
-            self._reader.close()
+        reader = self._reader
+        self._reader = iter(())
+        try:
+            if isinstance(reader, TextFileReader):
+                reader.close()
+        finally:
+            if self._csv_stream is not None:
+                self._csv_stream.close()
 
     def iterrows(self) -> Iterator[tuple[int, dict[str, Any]]]:
         """Iterate over rows as (index, row_dict) tuples.
@@ -147,9 +157,13 @@ class PandasDataFrameIterator(abc.Iterator):  # type: ignore[type-arg]
         """
         from pandas.io.parsers import TextFileReader
 
-        if isinstance(self._reader, TextFileReader):
-            return self._reader.get_chunk(size)
-        return next(self._reader)
+        try:
+            if isinstance(self._reader, TextFileReader):
+                return self._reader.get_chunk(size)
+            return next(self._reader)
+        except BaseException:
+            self.close()
+            raise
 
     def as_pandas(self) -> DataFrame:
         """Collect all chunks into a single DataFrame.
@@ -302,7 +316,7 @@ class AthenaPandasResultSet(AthenaResultSet):
         if self.state == AthenaQueryExecution.STATE_SUCCEEDED and self.output_location:
             df = self._as_pandas()
             trunc_date = _no_trunc_date if self.is_unload else self._trunc_date
-            self._df_iter = PandasDataFrameIterator(df, trunc_date)
+            self._df_iter = PandasDataFrameIterator(df, trunc_date, self._csv_stream)
         elif self.state == AthenaQueryExecution.STATE_SUCCEEDED:
             df = self._as_pandas_from_api()
             self._df_iter = PandasDataFrameIterator(df, self._trunc_date)
@@ -531,15 +545,19 @@ class AthenaPandasResultSet(AthenaResultSet):
         read_csv_kwargs = self._get_csv_read_options(csv_engine, effective_chunksize)
 
         try:
-            source: str | TextIOWrapper = self.output_location
-            binary_columns = self._configure_binary_csv_read(read_csv_kwargs, pd.read_csv)
-            if binary_columns:
-                storage_options = read_csv_kwargs.pop("storage_options", None) or {}
-                self._csv_stream = self._open_binary_csv_stream(binary_columns, storage_options)
-                source = self._csv_stream
-            result = pd.read_csv(source, **read_csv_kwargs)
-            if isinstance(result, pd.DataFrame) and self._csv_stream is not None:
-                self._csv_stream.close()
+            with ExitStack() as stack:
+                source: str | TextIOWrapper = self.output_location
+                binary_columns = self._configure_binary_csv_read(read_csv_kwargs, pd.read_csv)
+                if binary_columns:
+                    storage_options = read_csv_kwargs.pop("storage_options", None) or {}
+                    self._csv_stream = stack.enter_context(
+                        self._open_binary_csv_stream(binary_columns, storage_options)
+                    )
+                    source = self._csv_stream
+                result = pd.read_csv(source, **read_csv_kwargs)
+                if not isinstance(result, pd.DataFrame):
+                    # The chunk iterator takes ownership of the stream.
+                    stack.pop_all()
 
             # Log performance information for large files
             if length > self.LARGE_FILE_THRESHOLD_BYTES:
@@ -553,8 +571,6 @@ class AthenaPandasResultSet(AthenaResultSet):
             return result
 
         except Exception as e:
-            if self._csv_stream is not None:
-                self._csv_stream.close()
             _logger.exception(f"Failed to read {self.output_location}.")
             raise OperationalError(*e.args) from e
 
@@ -701,22 +717,21 @@ class AthenaPandasResultSet(AthenaResultSet):
         self, binary_columns: set[int], storage_options: dict[str, Any]
     ) -> TextIOWrapper:
         """Open a stream that preserves binary NULL fields and original CSV newlines."""
-        return TextIOWrapper(
-            BufferedReader(
-                BinaryCSVReader(
-                    filesystem_open(
-                        self.output_location,
-                        mode="rt",
-                        encoding="utf-8",
-                        newline="",
-                        **storage_options,
-                    ).open(),
-                    binary_columns,
+        with ExitStack() as stack:
+            source = stack.enter_context(
+                filesystem_open(
+                    self.output_location,
+                    mode="rt",
+                    encoding="utf-8",
+                    newline="",
+                    **storage_options,
                 )
-            ),
-            encoding="utf-8",
-            newline="",
-        )
+            )
+            reader = stack.enter_context(BinaryCSVReader(source, binary_columns))
+            buffer = stack.enter_context(BufferedReader(reader))
+            stream = TextIOWrapper(buffer, encoding="utf-8", newline="")
+            stack.pop_all()
+            return stream
 
     def _read_parquet(self, engine) -> DataFrame:
         import pandas as pd
@@ -838,8 +853,6 @@ class AthenaPandasResultSet(AthenaResultSet):
 
         super().close()
         self._df_iter.close()
-        if self._csv_stream is not None:
-            self._csv_stream.close()
         self._df_iter = PandasDataFrameIterator(pd.DataFrame(), _no_trunc_date)
         self._iterrows = enumerate([])
         self._data_manifest = []
