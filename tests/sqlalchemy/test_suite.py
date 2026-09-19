@@ -119,7 +119,10 @@ class ComponentReflectionTestExtra(_ComponentReflectionTestExtra):
         table = Table("listed_metadata", metadata, Column("id", Integer, comment="identifier"))
         table.create(connection)
         inspector = inspect(connection)
-        client = connection.connection.driver_connection.client
+        raw_connection = connection.connection.driver_connection
+        if connection.dialect.is_async:
+            raw_connection = raw_connection.driver_connection
+        client = raw_connection.client
         calls = []
 
         def record_call(model, **kwargs):
