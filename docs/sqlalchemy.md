@@ -73,6 +73,29 @@ async with engine.connect() as connection:
     )
 ```
 
+## Reflection and identifiers
+
+The dialect reflects schemas, tables, views, columns, comments, and Athena table options.
+Athena does not support primary key, foreign key, unique, or index constraints.
+Its `CREATE TABLE` syntax does not enforce `nullable=False`, and reflected columns report `nullable=True` and `autoincrement=False`.
+Iceberg strings do not preserve `CHAR` or `VARCHAR` length constraints; `CHAR` is not a supported Iceberg type.
+See the [Iceberg data type documentation](https://docs.aws.amazon.com/athena/latest/ug/querying-iceberg-supported-data-types.html).
+Table comments returned by Athena metadata can have whitespace and line breaks normalized.
+Athena does not persist the table-level `COMMENT` when creating an Iceberg table, so its reflected table comment is `None`; column comments are preserved.
+
+SQLAlchemy's Inspector caches reflection results, including both positive and negative `has_table()` results.
+After creating or dropping a table, use a new Inspector or call `inspector.clear_cache()` (SQLAlchemy 2.0+) before inspecting it again.
+The dialect does not cache direct `has_table()` calls without an `info_cache`.
+
+Use SQLAlchemy's identifier quoting for reserved words or names beginning with an underscore.
+The dialect uses backticks for table DDL and double quotes for DML.
+Quoted names still follow Athena's naming rules: Athena lowercases identifiers, and table names containing spaces or embedded quotes are not supported.
+The dialect declares a maximum identifier length of 255 characters to SQLAlchemy.
+For table names longer than 128 characters, reflection uses Athena's `ListTableMetadata` API because [`GetTableMetadata`](https://docs.aws.amazon.com/athena/latest/APIReference/API_GetTableMetadata.html) rejects those names.
+Both APIs limit database names to 128 characters, so reflection is limited to schemas within that length.
+AWS also specifies a maximum of 255 UTF-8 bytes for database, table, and column names, so the character limit alone does not validate multibyte names.
+See [Athena's naming rules](https://docs.aws.amazon.com/athena/latest/ug/tables-databases-columns-names.html) and [CREATE TABLE restrictions](https://docs.aws.amazon.com/athena/latest/ug/create-table.html).
+
 ## Connection string
 
 The connection string has the following format:
