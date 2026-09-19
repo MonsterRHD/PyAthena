@@ -317,11 +317,13 @@ class AthenaArray(sqltypes.ARRAY[Any]):
                 return None
             if isinstance(value, str):
                 try:
-                    value = json.loads(value, parse_float=Decimal)
+                    value = json.loads(value)
                 except json.JSONDecodeError:
                     # Textual SQL does not receive column_expression. Preserve the
                     # DBAPI's raw fallback when native nested data is ambiguous.
                     return value
+            if isinstance(value, dict) and "_pyathena_array" in value:
+                value = value["_pyathena_array"]
             return _decode_complex(value, self, self.as_tuple)
 
         return process

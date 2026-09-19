@@ -435,7 +435,9 @@ class AthenaStatementCompiler(SQLCompiler):
 
     def visit_athena_array_result(self, expression, **kw):
         value = self.process(expression.element, **kw)
-        return f"json_format({self._array_json(value, expression.type)})"
+        encoded = self._array_json(value, expression.type)
+        # An object envelope keeps SQL NULL and CSV null markers out of the transport.
+        return f"json_format(CAST(MAP(ARRAY['_pyathena_array'], ARRAY[{encoded}]) AS JSON))"
 
     def _array_json(self, value, type_, depth=0):
         # Each recursive value becomes JSON, including map keys and typed scalar leaves.
