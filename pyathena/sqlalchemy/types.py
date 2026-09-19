@@ -389,7 +389,12 @@ def _complex_values(value: Any, type_: TypeEngine[Any]):
 def _decorator_impl(type_: types.TypeDecorator[Any], dialect: Any) -> TypeEngine[Any]:
     if dialect.name in type_._variant_mapping:
         return type_._variant_mapping[dialect.name]
-    return type_.load_dialect_impl(dialect)
+    implementation = type_.load_dialect_impl(dialect)
+    if isinstance(implementation, AthenaTimestamp):
+        return types.TIMESTAMP()
+    if isinstance(implementation, AthenaDate):
+        return types.DATE()
+    return implementation
 
 
 def _has_unknown_array_element(type_: TypeEngine[Any]) -> bool:
@@ -406,6 +411,12 @@ def _has_unknown_array_element(type_: TypeEngine[Any]) -> bool:
 
 def _bind_complex(value: Any, type_: TypeEngine[Any], dialect: Any) -> Any:
     if isinstance(type_, types.TypeDecorator):
+        if (
+            dialect.name not in type_._variant_mapping
+            and type(type_).bind_processor is not types.TypeDecorator.bind_processor
+        ):
+            processor = type_.bind_processor(dialect)
+            return processor(value) if processor else value
         if dialect.name not in type_._variant_mapping and type_._has_bind_processor:
             value = type_.process_bind_param(value, dialect)
         return _bind_complex(value, _decorator_impl(type_, dialect), dialect)
@@ -432,6 +443,13 @@ def _bind_complex(value: Any, type_: TypeEngine[Any], dialect: Any) -> Any:
 
 def _literal_complex(value: Any, type_: TypeEngine[Any], dialect: Any) -> str:
     if isinstance(type_, types.TypeDecorator):
+        if (
+            dialect.name not in type_._variant_mapping
+            and type(type_).literal_processor is not types.TypeDecorator.literal_processor
+        ):
+            literal_override = type_.literal_processor(dialect)
+            if literal_override is not None:
+                return literal_override(value)
         if dialect.name not in type_._variant_mapping:
             if type_._has_literal_processor:
                 value = type_.process_literal_param(value, dialect)
@@ -469,6 +487,12 @@ def _decode_complex(
 ) -> Any:
     if isinstance(type_, types.TypeDecorator):
         value = _decode_complex(value, _decorator_impl(type_, dialect), as_tuple, dialect)
+        if (
+            dialect.name not in type_._variant_mapping
+            and type(type_).result_processor is not types.TypeDecorator.result_processor
+        ):
+            processor = type_.result_processor(dialect, None)
+            return processor(value) if processor else value
         if dialect.name not in type_._variant_mapping and type_._has_result_processor:
             return type_.process_result_value(value, dialect)
         return value
