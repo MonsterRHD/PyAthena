@@ -75,7 +75,11 @@ class TestPandasCursor:
             connect(cursor_class=PandasCursor, converter=converter) as conn,
             conn.cursor() as cursor,
         ):
-            cursor.execute("SELECT X'00ff' AS value, repeat('x', 200) AS padding", engine=engine)
+            cursor.execute(
+                "SELECT X'00ff' AS value, %(padding)s AS padding",
+                {"padding": "x" * 200},
+                engine=engine,
+            )
             assert cursor.fetchone() == ("00 ff", "x" * 200)
 
     def test_binary_single_null(self, pandas_cursor):
