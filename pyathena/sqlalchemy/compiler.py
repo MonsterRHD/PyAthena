@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, cast
 
@@ -15,6 +16,7 @@ from sqlalchemy.sql.compiler import (
 from sqlalchemy.sql.elements import (
     BindParameter,
     Cast,
+    TextClause,
     UnaryExpression,
     _label_reference,
     _textual_label_reference,
@@ -291,6 +293,25 @@ class AthenaStatementCompiler(SQLCompiler):
             return None
 
         for clause in statement._order_by_clauses:
+            if isinstance(clause, TextClause):
+                match = re.fullmatch(
+                    r'\s*("(?:[^"]|"")+"|[\w]+)(?:\s+(ASC|DESC))?(?:\s+NULLS\s+(FIRST|LAST))?\s*',
+                    clause.text,
+                    re.IGNORECASE,
+                )
+                if match:
+                    name, direction, nulls = match.groups()
+                    name = name[1:-1].replace('""', '"') if name.startswith('"') else name
+                    if name in statement.selected_columns:
+                        clause = statement.selected_columns[name]
+                        if direction:
+                            clause = clause.desc() if direction.upper() == "DESC" else clause.asc()
+                        if nulls:
+                            clause = (
+                                clause.nulls_first()
+                                if nulls.upper() == "FIRST"
+                                else clause.nulls_last()
+                            )
             clause = visitors.replacement_traverse(clause, {}, resolve_label)
             modifiers = []
             while isinstance(clause, UnaryExpression) and clause.modifier in (
@@ -302,7 +323,12 @@ class AthenaStatementCompiler(SQLCompiler):
                 modifiers.append(clause.modifier)
                 clause = clause.element
             index = next((i for i, column in enumerate(columns) if column.compare(clause)), None)
-            if index is None and hasattr(inner, "add_columns") and not inner._distinct:
+            if (
+                index is None
+                and hasattr(inner, "add_columns")
+                and not inner._distinct
+                and not isinstance(clause, TextClause)
+            ):
                 name = f"_pyathena_order_{len(hidden)}"
                 while name in statement.selected_columns:
                     name += "_"
@@ -410,6 +436,12 @@ class AthenaStatementCompiler(SQLCompiler):
         return f"CAST({cast.clause._compiler_dispatch(self, **kwargs)} AS {type_clause})"
 
     def _complex_dml_type(self, type_):
+        if isinstance(type_, types.TypeDecorator):
+            implementation = type_.dialect_impl(self.dialect)
+            assert isinstance(implementation, types.TypeDecorator)
+            return self._complex_dml_type(implementation.impl_instance)
+        if isinstance(type_, types.NullType):
+            raise exc.CompileError("Bound ARRAY values require an explicit element type")
         if isinstance(type_, types.ARRAY):
             return f"ARRAY({self._complex_dml_type(_array_item_type(type_))})"
         if isinstance(type_, AthenaMap):
@@ -424,10 +456,10 @@ class AthenaStatementCompiler(SQLCompiler):
             )
             return f"ROW({fields})"
         if isinstance(type_, types.String):
-            return f"VARCHAR({type_.length})" if type_.length else "VARCHAR"
+            return "VARCHAR"
         if isinstance(type_, (types.LargeBinary, types.BINARY, types.VARBINARY)):
             return "VARBINARY"
-        if isinstance(type_, get_double_type()) and not isinstance(type_, types.REAL):
+        if isinstance(type_, getattr(types, "Double", get_double_type())):
             return "DOUBLE"
         if isinstance(type_, types.Float):
             return "REAL"
@@ -440,6 +472,10 @@ class AthenaStatementCompiler(SQLCompiler):
         return f"json_format(CAST(MAP(ARRAY['_pyathena_array'], ARRAY[{encoded}]) AS JSON))"
 
     def _array_json(self, value, type_, depth=0):
+        if isinstance(type_, types.TypeDecorator):
+            implementation = type_.dialect_impl(self.dialect)
+            assert isinstance(implementation, types.TypeDecorator)
+            return self._array_json(value, implementation.impl_instance, depth)
         # Each recursive value becomes JSON, including map keys and typed scalar leaves.
         variable = f"_pyathena_array_{depth}"
         if isinstance(type_, types.ARRAY):
@@ -463,7 +499,7 @@ class AthenaStatementCompiler(SQLCompiler):
                 f"IF({value} IS NULL, CAST(NULL AS JSON), "
                 f"CAST(MAP(ARRAY[{names}], ARRAY[{fields}]) AS JSON))"
             )
-        if isinstance(type_, (types.JSON, AthenaStruct)):
+        if isinstance(type_, (types.JSON, types.NullType, AthenaStruct)):
             return f"CAST({value} AS JSON)"
         if isinstance(type_, (types.LargeBinary, types.BINARY, types.VARBINARY)):
             return f"CAST(to_hex({value}) AS JSON)"

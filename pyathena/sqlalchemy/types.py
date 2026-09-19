@@ -334,7 +334,7 @@ class AthenaArray(sqltypes.ARRAY[Any]):
                     return value
             if isinstance(value, dict) and "_pyathena_array" in value:
                 value = value["_pyathena_array"]
-            return _decode_complex(value, self, self.as_tuple)
+            return _decode_complex(value, self, self.as_tuple, dialect)
 
         return process
 
@@ -443,23 +443,36 @@ def _literal_complex(value: Any, type_: TypeEngine[Any], dialect: Any) -> str:
     return str(processor(value))
 
 
-def _decode_complex(value: Any, type_: TypeEngine[Any], as_tuple: bool = False) -> Any:
+def _decode_complex(
+    value: Any, type_: TypeEngine[Any], as_tuple: bool = False, dialect: Any = None
+) -> Any:
     if value is None:
         return None
+    if isinstance(type_, types.TypeDecorator):
+        implementation = type_.dialect_impl(dialect)
+        assert isinstance(implementation, types.TypeDecorator)
+        value = _decode_complex(value, implementation.impl_instance, as_tuple, dialect)
+        if implementation._has_result_processor:
+            return implementation.process_result_value(value, dialect)
+        return value
     if isinstance(type_, sqltypes.ARRAY):
-        items = [_decode_complex(item, _array_item_type(type_), as_tuple) for item in value]
+        items = [
+            _decode_complex(item, _array_item_type(type_), as_tuple, dialect) for item in value
+        ]
         return tuple(items) if as_tuple else items
     if isinstance(type_, AthenaMap):
         map_items = value.items() if isinstance(value, dict) else value
         return {
-            _decode_complex(key, type_.key_type): _decode_complex(item, type_.value_type, as_tuple)
+            _decode_complex(key, type_.key_type, dialect=dialect): _decode_complex(
+                item, type_.value_type, as_tuple, dialect
+            )
             for key, item in map_items
         }
     if isinstance(type_, AthenaStruct):
         if not type_.fields:
             return value
         return {
-            name: _decode_complex(value[name], field_type, as_tuple)
+            name: _decode_complex(value[name], field_type, as_tuple, dialect)
             for name, field_type in type_.fields.items()
         }
     if isinstance(type_, types.JSON):
@@ -477,5 +490,7 @@ def _decode_complex(value: Any, type_: TypeEngine[Any], as_tuple: bool = False) 
     if isinstance(type_, (types.LargeBinary, types.BINARY, types.VARBINARY)):
         return value if isinstance(value, bytes) else bytes.fromhex(value)
     if isinstance(type_, types.String):
-        return str(value)
+        value = str(value)
+        processor = type_.dialect_impl(dialect).result_processor(dialect, None)
+        return processor(value) if processor else value
     return value

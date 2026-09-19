@@ -15,6 +15,7 @@ from sqlalchemy import (
     inspect,
     literal,
     select,
+    text,
     types,
 )
 from sqlalchemy import Table as SATable
@@ -137,7 +138,7 @@ class NativeArrayTest(fixtures.TestBase):
             [{"id": 1, "value": [10]}, {"id": 2, "value": [2]}, {"id": 3, "value": [2]}],
         )
         value = table.c.value.label("items")
-        for ordering in (value, "items"):
+        for ordering in (value, "items", text("items")):
             stmt = select(value).distinct().order_by(ordering)
             eq_(connection.execute(stmt).scalars().all(), [[2], [10]])
         eq_(
@@ -151,6 +152,20 @@ class NativeArrayTest(fixtures.TestBase):
             .order_by("value")
         )
         eq_(connection.execute(union).scalars().all(), [[2], [10]])
+
+    def test_review_regressions(self, connection):
+        expressions = [
+            literal(["a-very-long-string"], AthenaArray(String(3))),
+            literal([0.1], AthenaArray(types.Double)),
+            literal([0.1], AthenaArray(types.DOUBLE_PRECISION)),
+            func.array_agg(func.length(literal("abc"))),
+        ]
+        # Aggregate and scalar expressions are checked separately for Athena grouping rules.
+        eq_(
+            tuple(connection.execute(select(*expressions[:3])).one()),
+            (["a-very-long-string"], [0.1], [0.1]),
+        )
+        eq_(connection.execute(select(expressions[3])).scalar_one(), [3])
 
     def test_reflection_and_executemany(self, connection, metadata):
         table = Table(

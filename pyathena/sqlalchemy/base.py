@@ -555,13 +555,19 @@ class AthenaDialect(DefaultDialect):
         if _nested and name in ("row", "struct") and length:
             fields = []
             for field in _split_type_arguments(length):
+                pattern = (
+                    r'\s*("(?:[^"]|"")*"|`(?:[^`]|``)*`|[^:]+)\s*:\s*(.+)'
+                    if name == "struct"
+                    else r'\s*("(?:[^"]|"")*"|`(?:[^`]|``)*`|[^\s:]+)(?:\s*:\s*|\s+)(.+)'
+                )
                 match = re.fullmatch(
-                    r'\s*("(?:[^"]|"")*"|`(?:[^`]|``)*`|[^\s:]+)(?:\s*:\s*|\s+)(.+)',
+                    pattern,
                     field,
                 )
                 if match is None:
                     raise ValueError(f"Invalid ROW field: {field!r}")
                 field_name, field_type = match.groups()
+                field_name = field_name.strip()
                 if field_name[0] in ('"', "`"):
                     quote = field_name[0]
                     field_name = field_name[1:-1].replace(quote * 2, quote)
