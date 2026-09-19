@@ -33,6 +33,7 @@ from pyathena.model import (
     AthenaPartitionTransform,
     AthenaRowFormatSerde,
 )
+from pyathena.sqlalchemy._array_update import compile_array_update, rewrite_array_update
 from pyathena.sqlalchemy.preparer import AthenaDDLIdentifierPreparer
 from pyathena.sqlalchemy.types import (
     AthenaMap,
@@ -268,6 +269,15 @@ class AthenaStatementCompiler(SQLCompiler):
 
     def visit_char_length_func(self, fn: Function[Any], **kw: Any) -> str:
         return f"length{self.function_argspec(fn, **kw)}"
+
+    def visit_update(self, update_stmt, visiting_cte=None, **kw):
+        """Rewrite partial array assignments into one native Athena UPDATE."""
+        return super().visit_update(
+            rewrite_array_update(update_stmt), visiting_cte=visiting_cte, **kw
+        )
+
+    def visit_athena_array_update(self, expression, **kw):
+        return compile_array_update(self, expression, **kw)
 
     def _array_lambda_name(self):
         names = {
