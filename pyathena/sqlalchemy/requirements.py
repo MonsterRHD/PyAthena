@@ -7,6 +7,16 @@ unsupported = exclusions.closed
 
 class Requirements(SuiteRequirements):
     @property
+    def comment_reflection(self):
+        # The upstream requirement also needs COMMENT ON TABLE. Athena only
+        # reflects table comments from Hive tables, not Iceberg tables.
+        return unsupported()
+
+    @property
+    def reflect_table_options(self):
+        return supported()
+
+    @property
     def array_type(self):
         return unsupported()
 

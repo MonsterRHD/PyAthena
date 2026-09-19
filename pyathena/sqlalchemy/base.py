@@ -134,6 +134,7 @@ class AthenaDialect(DefaultDialect):
     ddl_compiler: type[DDLCompiler] = AthenaDDLCompiler
     type_compiler: type[GenericTypeCompiler] = AthenaTypeCompiler
     default_paramstyle: str = pyathena.paramstyle
+    max_identifier_length: int = 255
     cte_follows_insert: bool = True
     supports_alter: bool = False
     supports_pk_autoincrement: bool | None = False
@@ -269,6 +270,21 @@ class AthenaDialect(DefaultDialect):
         schema = schema if schema else raw_connection.schema_name  # type: ignore[union-attr]
         with raw_connection.driver_connection.cursor() as cursor:  # type: ignore[union-attr]
             try:
+                # GetTableMetadata limits table names to 128 characters, while
+                # Athena SQL and ListTableMetadata support longer table names.
+                if len(table_name) > 128:
+                    name = str(table_name).lower()
+                    expression = re.escape(name)
+                    # ListTableMetadata limits its regex filter to 256 characters.
+                    # Unusual catalog names can exceed that after regex escaping.
+                    for metadata in cursor.list_table_metadata(
+                        schema_name=schema,
+                        expression=expression if len(expression) <= 256 else None,
+                        logging_=False,
+                    ):
+                        if metadata.name == name:
+                            return metadata
+                    raise exc.NoSuchTableError(table_name)
                 return cursor.get_table_metadata(table_name, schema_name=schema, logging_=False)
             except pyathena.error.OperationalError as e:
                 cause = e.__cause__
@@ -328,9 +344,10 @@ class AthenaDialect(DefaultDialect):
             "awsathena_tblproperties": _HashableDict(metadata.table_properties),
         }
 
+    @reflection.cache
     def has_table(self, connection: Connection, table_name: str, schema: str | None = None, **kw):
         try:
-            columns = self.get_columns(connection, table_name, schema)
+            columns = self.get_columns(connection, table_name, schema, **kw)
             return bool(columns)
         except exc.NoSuchTableError:
             return False
