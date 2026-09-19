@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from collections import abc
 from collections.abc import Callable, Iterable, Iterator
+from functools import partial
+from io import BufferedReader, TextIOWrapper
 from multiprocessing import cpu_count
 from typing import (
     TYPE_CHECKING,
@@ -10,10 +12,13 @@ from typing import (
     ClassVar,
 )
 
+from fsspec import open as filesystem_open
+
 from pyathena import OperationalError
 from pyathena.converter import Converter
 from pyathena.error import ProgrammingError
 from pyathena.model import AthenaQueryExecution
+from pyathena.pandas.reader import _BINARY_NULL, BinaryCSVReader
 from pyathena.result_set import AthenaResultSet
 from pyathena.util import RetryConfig, parse_output_location
 
@@ -24,6 +29,10 @@ if TYPE_CHECKING:
     from pyathena.connection import Connection
 
 _logger = logging.getLogger(__name__)
+
+
+def _convert_binary_csv(converter: Callable[[str | None], Any], value: str) -> Any:
+    return converter(None if value == _BINARY_NULL else value)
 
 
 def _no_trunc_date(df: DataFrame) -> DataFrame:
@@ -281,6 +290,7 @@ class AthenaPandasResultSet(AthenaResultSet):
         self._data_manifest: list[str] = []
         self._kwargs = kwargs
         self._fs = self.__s3_file_system()
+        self._csv_stream: TextIOWrapper | None = None
 
         # Cache time column names for efficient _trunc_date processing
         description = self.description if self.description else []
@@ -529,7 +539,7 @@ class AthenaPandasResultSet(AthenaResultSet):
                 )
 
         csv_engine = self._get_csv_engine(length, effective_chunksize)
-        read_csv_kwargs = {
+        read_csv_kwargs: dict[str, Any] = {
             "sep": sep,
             "header": header,
             "names": names,
@@ -559,7 +569,46 @@ class AthenaPandasResultSet(AthenaResultSet):
         read_csv_kwargs.update(self._kwargs)
 
         try:
-            result = pd.read_csv(self.output_location, **read_csv_kwargs)
+            source: str | TextIOWrapper = self.output_location
+            description = self.description if self.description else []
+            converters = dict(read_csv_kwargs.get("converters") or {})
+            binary_columns = {
+                i
+                for i, d in enumerate(description)
+                if d[1] == "varbinary" and (d[0] in converters or i in converters)
+            }
+            if (
+                binary_columns
+                and "converters" not in self._kwargs
+                and self.output_location.endswith(".csv")
+            ):
+                for index in binary_columns:
+                    name = description[index][0]
+                    key = index if index in converters else name
+                    converter = converters[key]
+                    converters[key] = partial(_convert_binary_csv, converter)
+                read_csv_kwargs["converters"] = converters
+                storage_options = read_csv_kwargs.pop("storage_options", None) or {}
+                self._csv_stream = TextIOWrapper(
+                    BufferedReader(
+                        BinaryCSVReader(
+                            filesystem_open(
+                                self.output_location,
+                                mode="rt",
+                                encoding="utf-8",
+                                newline="",
+                                **storage_options,
+                            ).open(),
+                            binary_columns,
+                        )
+                    ),
+                    encoding="utf-8",
+                    newline="",
+                )
+                source = self._csv_stream
+            result = pd.read_csv(source, **read_csv_kwargs)
+            if isinstance(result, pd.DataFrame) and self._csv_stream is not None:
+                self._csv_stream.close()
 
             # Log performance information for large files
             if length > self.LARGE_FILE_THRESHOLD_BYTES:
@@ -573,6 +622,8 @@ class AthenaPandasResultSet(AthenaResultSet):
             return result
 
         except Exception as e:
+            if self._csv_stream is not None:
+                self._csv_stream.close()
             _logger.exception(f"Failed to read {self.output_location}.")
             raise OperationalError(*e.args) from e
 
@@ -695,6 +746,9 @@ class AthenaPandasResultSet(AthenaResultSet):
         import pandas as pd
 
         super().close()
+        self._df_iter.close()
+        if self._csv_stream is not None:
+            self._csv_stream.close()
         self._df_iter = PandasDataFrameIterator(pd.DataFrame(), _no_trunc_date)
         self._iterrows = enumerate([])
         self._data_manifest = []

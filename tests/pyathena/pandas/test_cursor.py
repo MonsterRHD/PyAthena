@@ -13,6 +13,7 @@ import pandas as pd
 import pytest
 
 from pyathena.error import DatabaseError, ProgrammingError
+from pyathena.pandas.converter import DefaultPandasTypeConverter
 from pyathena.pandas.cursor import PandasCursor
 from pyathena.pandas.result_set import AthenaPandasResultSet, PandasDataFrameIterator
 from tests import ENV
@@ -20,6 +21,67 @@ from tests.pyathena.conftest import connect
 
 
 class TestPandasCursor:
+    @pytest.mark.parametrize(
+        ("engine", "chunksize"), [("auto", None), ("c", 2), ("python", 2), ("pyarrow", None)]
+    )
+    def test_binary_null_vs_empty(self, pandas_cursor, engine, chunksize):
+        query = """SELECT * FROM (VALUES
+                    (1, CAST(NULL AS VARBINARY), 'null', CAST(NULL AS VARCHAR)),
+                    (2, X'', 'empty', ''),
+                    (3, X'00ff275c25',
+                     'comma, quote" and' || chr(13) || chr(10) || 'newline', 'NULL')
+                ) AS t(id, value, label, text_value) ORDER BY id"""
+        pandas_cursor.execute(query, engine=engine, chunksize=chunksize)
+        rows = pandas_cursor.fetchall()
+        assert [row[:3] for row in rows] == [
+            (1, None, "null"),
+            (2, b"", "empty"),
+            (3, b"\x00\xff'\\%", 'comma, quote" and\r\nnewline'),
+        ]
+
+        assert pd.isna(rows[0][3])
+        assert pd.isna(rows[1][3])
+        assert rows[2][3] == "NULL"
+
+    @pytest.mark.parametrize("chunksize", [None, 2])
+    def test_binary_as_pandas(self, pandas_cursor, chunksize):
+        pandas_cursor.execute(
+            "SELECT * FROM (VALUES (1, CAST(NULL AS VARBINARY)), (2, X''), (3, X'00ff')) "
+            "AS t(id, value) ORDER BY id",
+            chunksize=chunksize,
+            storage_options={"connection": pandas_cursor.connection, "default_cache_type": "none"},
+        )
+        result = pandas_cursor.as_pandas()
+        df = pd.concat(list(result), ignore_index=True) if chunksize else result
+        assert df["value"].tolist() == [None, b"", b"\x00\xff"]
+
+    def test_binary_converter_override(self, pandas_cursor):
+        pandas_cursor.execute(
+            "SELECT CAST(NULL AS VARBINARY) AS value, X'' AS empty_value",
+            converters={"value": bytes.fromhex, "empty_value": bytes.fromhex},
+        )
+        assert pandas_cursor.fetchone() == (b"", b"")
+        pandas_cursor.execute("SELECT X'00ff' AS value", converters={})
+        assert pandas_cursor.fetchone() == ("00 ff",)
+        pandas_cursor.execute("SELECT X'00ff' AS value", converters=None)
+        assert pandas_cursor.fetchone() == ("00 ff",)
+
+    @pytest.mark.parametrize("engine", ["c", "pyarrow"])
+    def test_binary_without_converter(self, engine):
+        converter = DefaultPandasTypeConverter()
+        for type_ in list(converter.mappings):
+            converter.remove(type_)
+        with (
+            connect(cursor_class=PandasCursor, converter=converter) as conn,
+            conn.cursor() as cursor,
+        ):
+            cursor.execute("SELECT X'00ff' AS value, repeat('x', 200) AS padding", engine=engine)
+            assert cursor.fetchone() == ("00 ff", "x" * 200)
+
+    def test_binary_single_null(self, pandas_cursor):
+        pandas_cursor.execute("SELECT CAST(NULL AS VARBINARY) AS value")
+        assert pandas_cursor.fetchall() == [(None,)]
+
     @pytest.mark.parametrize(
         ("pandas_cursor", "parquet_engine", "chunksize"),
         [
