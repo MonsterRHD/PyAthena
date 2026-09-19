@@ -298,18 +298,43 @@ class HasTableTest(_HasTableTest):
         raw_connection = _raw_connection(connection)
         error = _metadata_error("ThrottlingException", "Rate exceeded")
         calls = _fail_get_table_metadata(monkeypatch, raw_connection, error)
-        inspector = inspect(connection)
-        assert inspector.has_table(name) is exists
-        assert inspector.has_table(name.upper(), schema=raw_connection.schema_name) is exists
+        # The fallback must answer from the catalog even when result reuse is on.
+        monkeypatch.setitem(raw_connection.cursor_kwargs, "result_reuse_enable", True)
+        queries = []
+
+        def record_query(params, **kwargs):
+            queries.append(params)
+
+        event = "provide-client-params.athena.StartQueryExecution"
+        raw_connection.client.meta.events.register(event, record_query)
+        try:
+            inspector = inspect(connection)
+            assert inspector.has_table(name) is exists
+            assert inspector.has_table(name.upper(), schema=raw_connection.schema_name) is exists
+        finally:
+            raw_connection.client.meta.events.unregister(event, record_query)
         assert len(calls) == 2
+        assert len(queries) == 2
+        for query in queries:
+            assert "WHERE table_schema = " in query["QueryString"]
+            assert "lower(" not in query["QueryString"]
+            reuse = query["ResultReuseConfiguration"]["ResultReuseByAgeConfiguration"]
+            assert reuse["Enabled"] is False
         # Only existence falls back; reflection still reports the throttled request.
         with pytest.raises(OperationalError) as caught:
             inspector.get_columns(name)
         assert caught.value.__cause__ is error
 
-    @sa_testing.combinations("AccessDeniedException", None, argnames="code")
+    @sa_testing.combinations(
+        "AccessDeniedException", "InternalServerException", None, argnames="code"
+    )
     def test_metadata_errors_do_not_establish_absence(self, connection, monkeypatch, code):
         raw_connection = _raw_connection(connection)
+        if code == "InternalServerException":
+            # A code the retry policy covers still does not reach the existence fallback.
+            monkeypatch.setattr(
+                raw_connection.retry_config, "exceptions", ("ThrottlingException", code)
+            )
         message = (
             "Catalog error (Service: AmazonDataCatalog; Status Code: 400; "
             f"Error Code: {code}; Request ID: example; Proxy: null)"

@@ -1,8 +1,10 @@
+import contextlib
 import re
 import textwrap
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 from urllib.parse import quote_plus
 
 import numpy as np
@@ -16,6 +18,7 @@ from sqlalchemy.sql.ddl import CreateTable
 from sqlalchemy.sql.schema import Column, MetaData, Table
 from sqlalchemy.sql.selectable import TextualSelect
 
+from pyathena.sqlalchemy.base import AthenaDialect
 from pyathena.sqlalchemy.types import (
     TINYINT,
     AthenaArray,
@@ -44,6 +47,44 @@ def unique_s3tables_table_name(base: str) -> str:
     would collide across those concurrent jobs; a random suffix keeps them apart.
     """
     return f"{base}_{uuid.uuid4().hex[:8]}"
+
+
+class TestAthenaDialect:
+    def test_get_table_matches_long_names_case_insensitively(self):
+        # GetTableMetadata rejects names over 128 characters, so the lookup lists
+        # with a lowercase filter and matches the catalog's own casing.
+        table_name = "Long" + "x" * 130
+        listed = SimpleNamespace(name=table_name.lower(), columns=[], partition_keys=[])
+        requests = []
+
+        def list_table_metadata(**kwargs):
+            requests.append(kwargs)
+            return [listed]
+
+        cursor = SimpleNamespace(list_table_metadata=list_table_metadata)
+        raw_connection = SimpleNamespace(
+            cursor_kwargs={},
+            catalog_name="other_catalog",
+            schema_name="default",
+            driver_connection=SimpleNamespace(cursor=lambda: contextlib.nullcontext(cursor)),
+        )
+        connection = SimpleNamespace(connection=raw_connection)
+        info_cache = {}
+
+        metadata = AthenaDialect()._get_table(connection, table_name, info_cache=info_cache)
+
+        assert metadata is listed
+        assert requests == [
+            {
+                "schema_name": "default",
+                "expression": re.escape(table_name.lower()),
+                "logging_": False,
+            }
+        ]
+        # Outside AwsDataCatalog the cache keeps the caller's casing.
+        assert info_cache == {
+            ("pyathena_table_metadata", "other_catalog", "default", table_name): listed
+        }
 
 
 class TestSQLAlchemyAthena:
