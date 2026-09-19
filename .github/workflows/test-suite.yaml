@@ -14,6 +14,10 @@ jobs:
     env:
       TEST_TYPE: ${{ inputs.test-type }}
       AWS_DEFAULT_REGION: us-west-2
+      # Reflection bursts can exceed the metadata API rate quota even when
+      # concurrent DDL queries stay below their quota.
+      AWS_RETRY_MODE: adaptive
+      AWS_MAX_ATTEMPTS: '10'
       AWS_ATHENA_S3_STAGING_DIR: s3://laughingman7743-pyathena/github/
       AWS_ATHENA_WORKGROUP: pyathena
       AWS_ATHENA_SPARK_WORKGROUP: pyathena-spark
