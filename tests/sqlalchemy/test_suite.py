@@ -115,6 +115,30 @@ class ComponentReflectionTest(_ComponentReflectionTest):
 
 
 class ComponentReflectionTestExtra(_ComponentReflectionTestExtra):
+    def test_reuses_listed_table_metadata(self, connection, metadata):
+        table = Table("listed_metadata", metadata, Column("id", Integer, comment="identifier"))
+        table.create(connection)
+        inspector = inspect(connection)
+        client = connection.connection.driver_connection.client
+        calls = []
+
+        def record_call(model, **kwargs):
+            calls.append(model.name)
+
+        client.meta.events.register("before-call.athena", record_call)
+        try:
+            assert table.name in inspector.get_table_names()
+            assert inspector.get_columns(table.name)[0]["comment"] == "identifier"
+            assert inspector.get_table_options(table.name)["awsathena_location"]
+            assert inspector.has_table(table.name)
+            assert "ListTableMetadata" in calls
+            assert "GetTableMetadata" not in calls
+            inspector.clear_cache()
+            assert inspector.get_columns(table.name)[0]["name"] == "id"
+            assert calls.count("GetTableMetadata") == 1
+        finally:
+            client.meta.events.unregister("before-call.athena", record_call)
+
     @sa_testing.combinations((String, None), (VARCHAR, 52), (CHAR, 52), argnames="type_,length")
     def test_hive_string_length_reflection(self, connection, metadata, type_, length):
         table = Table(

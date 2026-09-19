@@ -4,10 +4,10 @@ import logging
 import re
 from collections.abc import Callable, Iterable
 from re import Pattern
-from typing import Any, cast
+from typing import Any
 
 import tenacity
-from tenacity import after_log, retry_if_exception, stop_after_attempt, wait_exponential
+from tenacity import after_log, retry_if_exception, stop_after_attempt, wait_random_exponential
 
 from pyathena import DataError
 
@@ -81,7 +81,7 @@ class RetryConfig:
     """Configuration for automatic retry behavior on failed API calls.
 
     This class configures how PyAthena handles transient failures when
-    communicating with AWS services. It uses exponential backoff with
+    communicating with AWS services. It uses exponential backoff with jitter and
     customizable parameters to retry failed operations.
 
     Attributes:
@@ -113,6 +113,8 @@ class RetryConfig:
     Note:
         Retries are applied to AWS API calls, not to SQL query execution.
         Query failures typically require manual intervention or query fixes.
+        Recognized Glue error codes wrapped in Athena MetadataException are
+        matched against exceptions in the same way as direct AWS error codes.
     """
 
     def __init__(
@@ -131,6 +133,27 @@ class RetryConfig:
         self.multiplier = multiplier
         self.max_delay = max_delay
         self.exponential_base = exponential_base
+
+
+def _get_error_code(ex: BaseException, unwrap_metadata: bool = False) -> str | None:
+    response = getattr(ex, "response", None)
+    error = response.get("Error") if isinstance(response, dict) else None
+    if not isinstance(error, dict):
+        return None
+    code = error.get("Code")
+    if unwrap_metadata and code == "MetadataException":
+        # Athena wraps Glue errors without marking them retryable in its model.
+        # Match the service error envelope, not arbitrary words in its message.
+        message = error.get("Message", "")
+        if isinstance(message, str):
+            match = re.search(
+                r"\(Service: AmazonDataCatalog; Status Code: \d+; "
+                r"Error Code: ([A-Za-z][A-Za-z0-9]+);",
+                message,
+            )
+            if match:
+                return match.group(1)
+    return code if isinstance(code, str) else None
 
 
 def retry_api_call(
@@ -171,22 +194,20 @@ def retry_api_call(
 
     Note:
         Only retries on AWS exceptions listed in the RetryConfig.exceptions.
-        Does not retry on client errors or non-AWS exceptions.
+        This includes recognized Glue error codes wrapped in MetadataException.
+        Other errors are propagated without retrying.
     """
 
-    def _extract_code(ex: BaseException) -> str | None:
-        resp = cast(dict[str, Any] | None, getattr(ex, "response", None))
-        err = cast(dict[str, Any] | None, (resp or {}).get("Error"))
-        return cast(str | None, (err or {}).get("Code"))
-
     def _is_retryable(ex: BaseException) -> bool:
-        code = _extract_code(ex)
-        return code is not None and code in config.exceptions
+        return any(
+            code is not None and code in config.exceptions
+            for code in (_get_error_code(ex), _get_error_code(ex, unwrap_metadata=True))
+        )
 
     retry = tenacity.Retrying(
         retry=retry_if_exception(_is_retryable),
         stop=stop_after_attempt(config.attempt),
-        wait=wait_exponential(
+        wait=wait_random_exponential(
             multiplier=config.multiplier,
             max=config.max_delay,
             exp_base=config.exponential_base,

@@ -89,6 +89,16 @@ SQLAlchemy's Inspector caches reflection results, including both positive and ne
 After creating or dropping a table, use a new Inspector or call `inspector.clear_cache()` (SQLAlchemy 2.0+) before inspecting it again.
 The dialect does not cache direct `has_table()` calls without an `info_cache`.
 
+Table listings include column and table metadata.
+The dialect reuses these positive results within the same Inspector, so subsequent column, comment, and table-option reflection does not fetch each listed table again.
+`clear_cache()` also discards this metadata; an absent entry in a listing is not cached as proof that a table does not exist.
+
+Metadata throttling and permission errors remain errors rather than being reported as missing tables.
+PyAthena recognizes Glue error codes in Athena's `MetadataException` service-error envelope and applies `RetryConfig.exceptions` to those codes.
+Its retry delays use exponential backoff with jitter to avoid synchronized retry bursts.
+SDK retries and PyAthena retries are separate layers, so increasing both attempt limits can multiply requests and waiting time.
+Adaptive SDK retries regulate individual clients, not the aggregate traffic from independent CI runners.
+
 Use SQLAlchemy's identifier quoting for reserved words or names beginning with an underscore.
 The dialect uses backticks for table DDL and double quotes for DML.
 Quoted names still follow Athena's naming rules: Athena lowercases identifiers, and table names containing spaces or embedded quotes are not supported.

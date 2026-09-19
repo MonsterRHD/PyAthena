@@ -37,7 +37,7 @@ from pyathena.sqlalchemy.types import (
     get_double_type,
 )
 from pyathena.sqlalchemy.util import _HashableDict
-from pyathena.util import strtobool
+from pyathena.util import _get_error_code, strtobool
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -268,6 +268,14 @@ class AthenaDialect(DefaultDialect):
     def _get_table(self, connection, table_name: str, schema: str | None = None, **kw):
         raw_connection = self._raw_connection(connection)
         schema = schema if schema else raw_connection.schema_name  # type: ignore[union-attr]
+        # ListTableMetadata already includes columns and table properties.
+        # Reuse positive results within this Inspector's cache, including for
+        # the default SQLAlchemy get_multi_* implementations.
+        info_cache = kw.get("info_cache")
+        if info_cache is not None:
+            metadata = info_cache.get(("pyathena_table_metadata", schema, str(table_name).lower()))
+            if metadata is not None:
+                return metadata
         with raw_connection.driver_connection.cursor() as cursor:  # type: ignore[union-attr]
             try:
                 # GetTableMetadata limits table names to 128 characters, while
@@ -290,7 +298,7 @@ class AthenaDialect(DefaultDialect):
                 cause = e.__cause__
                 if (
                     isinstance(cause, botocore.exceptions.ClientError)
-                    and cause.response["Error"]["Code"] == "MetadataException"
+                    and _get_error_code(cause, unwrap_metadata=True) == "EntityNotFoundException"
                 ):
                     raise exc.NoSuchTableError(table_name) from e
                 raise
@@ -300,7 +308,12 @@ class AthenaDialect(DefaultDialect):
         raw_connection = self._raw_connection(connection)
         schema = schema if schema else raw_connection.schema_name  # type: ignore[union-attr]
         with raw_connection.driver_connection.cursor() as cursor:  # type: ignore[union-attr]
-            return cursor.list_table_metadata(schema_name=schema)
+            tables = cursor.list_table_metadata(schema_name=schema)
+        info_cache = kw.get("info_cache")
+        if info_cache is not None:
+            for metadata in tables:
+                info_cache[("pyathena_table_metadata", schema, metadata.name)] = metadata
+        return tables
 
     def get_schema_names(self, connection, **kw):
         schemas = self._get_schemas(connection, **kw)

@@ -1,6 +1,7 @@
 from typing import Any
 
 import pytest
+from botocore.exceptions import ClientError
 
 from pyathena import DataError
 from pyathena.util import RetryConfig, parse_output_location, retry_api_call, strtobool
@@ -61,3 +62,54 @@ def test_retry_api_call():
 
 def test_retry_api_call_with_none_error():
     _test_retry(_NoResponseError())
+
+
+@pytest.mark.parametrize(
+    ("code", "message", "exceptions", "expected_calls"),
+    [
+        ("ThrottlingException", "Rate exceeded", ("ThrottlingException",), 2),
+        (
+            "MetadataException",
+            "Rate exceeded (Service: AmazonDataCatalog; Status Code: 400; "
+            "Error Code: ThrottlingException; Request ID: example; Proxy: null)",
+            ("ThrottlingException",),
+            2,
+        ),
+        (
+            "MetadataException",
+            "Not authorized (Service: AmazonDataCatalog; Status Code: 400; "
+            "Error Code: AccessDeniedException; Request ID: example; Proxy: null)",
+            ("ThrottlingException",),
+            1,
+        ),
+        ("MetadataException", "Table ThrottlingException not found", ("ThrottlingException",), 1),
+        ("MetadataException", "Rate exceeded", ("ThrottlingException",), 1),
+        (
+            "MetadataException",
+            "Rate exceeded (Service: AmazonDataCatalog; Status Code: 400; "
+            "Error Code: ThrottlingException; Request ID: example; Proxy: null)",
+            (),
+            1,
+        ),
+        ("MetadataException", "Custom error", ("MetadataException",), 2),
+    ],
+)
+def test_retry_metadata_errors(code, message, exceptions, expected_calls):
+    error = ClientError({"Error": {"Code": code, "Message": message}}, "GetTableMetadata")
+    calls = 0
+
+    def call():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise error
+        return "success"
+
+    config = RetryConfig(exceptions=exceptions, attempt=2, multiplier=0, max_delay=0)
+    if expected_calls == 1:
+        with pytest.raises(ClientError) as caught:
+            retry_api_call(call, config)
+        assert caught.value is error
+    else:
+        assert retry_api_call(call, config) == "success"
+    assert calls == expected_calls
