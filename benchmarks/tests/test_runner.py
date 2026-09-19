@@ -20,30 +20,6 @@ def waiting_worker(pipe, payload):
     time.sleep(30)
 
 
-def test_trial_uses_child_process_and_external_memory_samples(tmp_path):
-    result = supervise(
-        {"trial": "test"},
-        tmp_path / "events.jsonl",
-        replace(Settings(), timeout_seconds=20),
-        successful_worker,
-    )
-    assert result["status"] == "ok"
-    assert result["rss_peak_bytes"] >= result["rss_baseline_bytes"] > 0
-    assert result["resource_samples"]
-    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
-    assert events[0]["event"] == "ready"
-
-
-def test_timeout_does_not_become_a_successful_timing(tmp_path):
-    result = supervise(
-        {"trial": "test"},
-        tmp_path / "events.jsonl",
-        replace(Settings(), timeout_seconds=0.1),
-        waiting_worker,
-    )
-    assert result["status"] == "timeout"
-
-
 def test_observer_keeps_first_completion_and_query_id():
     events = []
 
@@ -71,30 +47,53 @@ def test_observer_keeps_first_completion_and_query_id():
     assert events[1]["statistics"]["DataScannedInBytes"] == 123
 
 
-@pytest.mark.parametrize("status", ["timeout", "memory_limit", "worker_exit", "error"])
-def test_failed_trial_stops_suite_before_any_more_queries(monkeypatch, tmp_path, status):
-    calls = []
-    monkeypatch.setattr(
-        "pyathena_bench.runner.validate_manifest",
-        lambda *args: {"ScratchDatabase": "scratch", "Bucket": "out"},
-    )
-    monkeypatch.setattr("pyathena_bench.runner.validate_inputs", lambda *args: None)
-    monkeypatch.setattr("pyathena_bench.runner.environment", lambda *args: {})
+class TestRunner:
+    def test_trial_uses_child_process_and_external_memory_samples(self, tmp_path):
+        result = supervise(
+            {"trial": "test"},
+            tmp_path / "events.jsonl",
+            replace(Settings(), timeout_seconds=20),
+            successful_worker,
+        )
+        assert result["status"] == "ok"
+        assert result["rss_peak_bytes"] >= result["rss_baseline_bytes"] > 0
+        assert result["resource_samples"]
+        events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+        assert events[0]["event"] == "ready"
 
-    def fail(payload, events, settings):
-        calls.append(payload)
-        return {"status": status}
+    def test_timeout_does_not_become_a_successful_timing(self, tmp_path):
+        result = supervise(
+            {"trial": "test"},
+            tmp_path / "events.jsonl",
+            replace(Settings(), timeout_seconds=0.1),
+            waiting_worker,
+        )
+        assert result["status"] == "timeout"
 
-    monkeypatch.setattr("pyathena_bench.runner.supervise", fail)
-    manifest = {
-        "run_id": "a" * 32,
-        "scales": {"small": {"table": "input", "rows": 10}},
-        "fixtures": {},
-    }
-    assert not run(
-        Settings(), manifest, [Case("cursor"), Case("dict")], ["small"], tmp_path / "run"
-    )
-    assert len(calls) == 1
-    assert calls[0]["warmup"]
-    result = json.loads((tmp_path / "run/trials.jsonl").read_text())
-    assert result["status"] == status
+    @pytest.mark.parametrize("status", ["timeout", "memory_limit", "worker_exit", "error"])
+    def test_failed_trial_stops_suite_before_any_more_queries(self, monkeypatch, tmp_path, status):
+        calls = []
+        monkeypatch.setattr(
+            "pyathena_bench.runner.validate_manifest",
+            lambda *args: {"ScratchDatabase": "scratch", "Bucket": "out"},
+        )
+        monkeypatch.setattr("pyathena_bench.runner.validate_inputs", lambda *args: None)
+        monkeypatch.setattr("pyathena_bench.runner.environment", lambda *args: {})
+
+        def fail(payload, events, settings):
+            calls.append(payload)
+            return {"status": status}
+
+        monkeypatch.setattr("pyathena_bench.runner.supervise", fail)
+        manifest = {
+            "run_id": "a" * 32,
+            "scales": {"small": {"table": "input", "rows": 10}},
+            "fixtures": {},
+        }
+        assert not run(
+            Settings(), manifest, [Case("cursor"), Case("dict")], ["small"], tmp_path / "run"
+        )
+        assert len(calls) == 1
+        assert calls[0]["warmup"]
+        result = json.loads((tmp_path / "run/trials.jsonl").read_text())
+        assert result["status"] == status
