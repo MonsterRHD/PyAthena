@@ -2,8 +2,10 @@ import json
 import time
 from dataclasses import replace
 
+import pytest
+from pyathena_bench.cases import Case
 from pyathena_bench.config import Settings
-from pyathena_bench.runner import Observer, supervise
+from pyathena_bench.runner import Observer, run, supervise
 
 
 def successful_worker(pipe, payload):
@@ -67,3 +69,32 @@ def test_observer_keeps_first_completion_and_query_id():
     assert [e["event"] for e in events] == ["query", "athena"]
     assert events[0]["output"] == "s3://out/"
     assert events[1]["statistics"]["DataScannedInBytes"] == 123
+
+
+@pytest.mark.parametrize("status", ["timeout", "memory_limit", "worker_exit", "error"])
+def test_failed_trial_stops_suite_before_any_more_queries(monkeypatch, tmp_path, status):
+    calls = []
+    monkeypatch.setattr(
+        "pyathena_bench.runner.validate_manifest",
+        lambda *args: {"ScratchDatabase": "scratch", "Bucket": "out"},
+    )
+    monkeypatch.setattr("pyathena_bench.runner.validate_inputs", lambda *args: None)
+    monkeypatch.setattr("pyathena_bench.runner.environment", lambda *args: {})
+
+    def fail(payload, events, settings):
+        calls.append(payload)
+        return {"status": status}
+
+    monkeypatch.setattr("pyathena_bench.runner.supervise", fail)
+    manifest = {
+        "run_id": "a" * 32,
+        "scales": {"small": {"table": "input", "rows": 10}},
+        "fixtures": {},
+    }
+    assert not run(
+        Settings(), manifest, [Case("cursor"), Case("dict")], ["small"], tmp_path / "run"
+    )
+    assert len(calls) == 1
+    assert calls[0]["warmup"]
+    result = json.loads((tmp_path / "run/trials.jsonl").read_text())
+    assert result["status"] == status

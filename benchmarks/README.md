@@ -206,6 +206,8 @@ An attempted operation that fails is recorded as a failure, not silently reclass
 Row-count validation detects incomplete consumption; it is not a proof that different libraries produce identical dtypes or nested Python objects.
 
 The parent stops a trial at the configured timeout or RSS fraction of physical RAM and attempts to cancel observed active queries.
+The suite stops at the first failed trial, including a failed warmup, so outstanding queries cannot affect later measurements.
+Inspect the recorded failure, run cleanup, and prepare a new snapshot before retrying in a new output directory.
 An external kill is reported as a worker exit, not automatically as an out-of-memory error.
 Use `cleanup` after interrupted runs to discover outstanding queries whose IDs were not returned before a worker died.
 Do not run two orchestrators concurrently on the same dedicated host.

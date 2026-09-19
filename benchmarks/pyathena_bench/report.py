@@ -54,9 +54,21 @@ def summarize(trials: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 ],
                 0.5,
             )
-        reasons = sorted(
-            {t.get("reason", t.get("error", t["status"])) for t in measured if t["status"] != "ok"}
-        )
+        reasons = set()
+        for trial in group:
+            if trial["status"] == "ok":
+                continue
+            prefix = "Warmup: " if trial.get("warmup") else ""
+            failures = [q for q in trial.get("queries", []) if q["status"] != "ok"]
+            if failures:
+                for query in failures:
+                    reason = query.get("error", query["status"])
+                    if query["status"] == "row_count_mismatch":
+                        reason += f": expected {query['expected_rows']}, got {query['rows']}"
+                    reasons.add(prefix + reason)
+            else:
+                reasons.add(prefix + trial.get("reason", trial.get("error", trial["status"])))
+            reasons.update(prefix + error for error in trial.get("cancellation_errors", []))
         rows.append(
             {
                 "scale": scale,
@@ -80,7 +92,7 @@ def summarize(trials: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "loop_lag_p95_seconds": percentile(lag, 0.95),
                 "loop_lag_max_seconds": max(lag, default=None),
                 "peak_threads": max((t["max_threads"] for t in good), default=None),
-                "notes": "; ".join(reasons),
+                "notes": "; ".join(sorted(reasons)),
             }
         )
     return rows

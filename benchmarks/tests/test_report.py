@@ -39,7 +39,7 @@ def test_summary_excludes_failures_and_warmups_but_reports_them():
     trials = [
         base,
         {**base, "warmup": True, "queries": [{"total_seconds": 999}]},
-        {**base, "status": "row_count_mismatch", "queries": [{"total_seconds": 0.01}]},
+        {**base, "status": "error", "queries": [{"status": "error", "error": "Access denied"}]},
         {
             "case_id": "unsupported",
             "scale": "small",
@@ -50,5 +50,25 @@ def test_summary_excludes_failures_and_warmups_but_reports_them():
     rows = summarize(trials)
     assert rows[0]["median_seconds"] == 2
     assert rows[0]["successful_trials"] == rows[0]["failed_trials"] == 1
+    assert rows[0]["notes"] == "Access denied"
     assert rows[1]["unsupported"]
     assert rows[1]["median_seconds"] is None
+
+
+def test_summary_preserves_failed_warmup_and_cancellation_reasons():
+    rows = summarize(
+        [
+            {
+                "case_id": "case",
+                "scale": "small",
+                "status": "error",
+                "warmup": True,
+                "queries": [{"status": "row_count_mismatch", "rows": 2, "expected_rows": 10}],
+                "cancellation_errors": ["q: StopQueryExecution denied"],
+            }
+        ]
+    )
+    assert rows[0]["failed_warmups"] == 1
+    assert rows[0]["median_seconds"] is None
+    assert "expected 10, got 2" in rows[0]["notes"]
+    assert "Warmup: q: StopQueryExecution denied" in rows[0]["notes"]

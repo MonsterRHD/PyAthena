@@ -325,6 +325,8 @@ def run(
                     },
                 )
                 success = success and result["status"] == "ok"
-                if result.get("interrupted"):
+                # A failed worker can leave an unobserved query running in Athena.
+                # Do not let it contaminate subsequent trials before cleanup.
+                if result["status"] != "ok":
                     return False
     return success
