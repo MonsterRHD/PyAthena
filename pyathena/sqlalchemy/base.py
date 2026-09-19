@@ -11,7 +11,6 @@ from typing import (
     cast,
 )
 
-import botocore
 from sqlalchemy import exc, schema, text, types, util
 from sqlalchemy.engine import Engine, reflection
 from sqlalchemy.engine.default import DefaultDialect
@@ -252,103 +251,90 @@ class AthenaDialect(DefaultDialect):
         return opts
 
     @staticmethod
-    def _metadata_identity(
-        raw_connection: PoolProxiedConnection, table_name: str | None, schema: str | None
-    ) -> tuple[str | None, str | None, str | None]:
-        """Resolve the catalog, schema and table name a metadata request uses.
+    def _cursor_option(raw_connection: PoolProxiedConnection, name: str) -> Any:
+        """Return a cursor option, letting ``cursor_kwargs`` override the connection default."""
+        return raw_connection.cursor_kwargs.get(name, getattr(raw_connection, name))
 
-        Cursor keyword arguments override the connection catalog. Glue lowercases
-        table names, so ``AwsDataCatalog`` lookups fold case; other catalogs keep
-        the name as given.
-        """
-        catalog = raw_connection.cursor_kwargs.get("catalog_name", raw_connection.catalog_name)
-        schema = schema if schema else raw_connection.schema_name
-        name = None
-        if table_name is not None:
-            name = (
-                str(table_name).lower()
-                if (catalog or "").lower() == "awsdatacatalog"
-                else str(table_name)
-            )
-        return catalog, schema, name
+    @staticmethod
+    def _fold_table_name(catalog: str | None, name: str) -> str:
+        """Glue lowercases table names, so ``AwsDataCatalog`` lookups fold case."""
+        return name.lower() if (catalog or "").lower() == "awsdatacatalog" else name
 
     @reflection.cache
     def _get_schemas(self, connection, **kw):
         raw_connection = self._raw_connection(connection)
-        catalog, _, _ = self._metadata_identity(raw_connection, None, None)
+        catalog = self._cursor_option(raw_connection, "catalog_name")
         with raw_connection.driver_connection.cursor() as cursor:  # type: ignore[union-attr]
             try:
                 return cursor.list_databases(catalog)
             except pyathena.error.OperationalError as e:
-                cause = e.__cause__
-                if (
-                    isinstance(cause, botocore.exceptions.ClientError)
-                    and cause.response["Error"]["Code"] == "InvalidRequestException"
-                ):
+                if _get_error_code(e.__cause__ or e) == "InvalidRequestException":
                     return []
                 raise
 
     def _get_table(self, connection, table_name: str, schema: str | None = None, **kw):
         raw_connection = self._raw_connection(connection)
-        catalog, schema, name = self._metadata_identity(raw_connection, table_name, schema)
+        catalog = self._cursor_option(raw_connection, "catalog_name")
+        schema = schema if schema else raw_connection.schema_name  # type: ignore[union-attr]
+        name = self._fold_table_name(catalog, str(table_name))
         # Key by the metadata request, not the reflection method's arguments.
         # Listings and individual lookups share positive results in this Inspector.
         info_cache = kw.get("info_cache")
+        if info_cache is None:
+            info_cache = {}
         cache_key = ("pyathena_table_metadata", catalog, schema, name)
-        if info_cache is not None:
-            metadata = info_cache.get(cache_key)
-            if metadata is not None:
-                return metadata
+        metadata = info_cache.get(cache_key)
+        if metadata is not None:
+            return metadata
         with raw_connection.driver_connection.cursor() as cursor:  # type: ignore[union-attr]
             try:
                 # GetTableMetadata limits table names to 128 characters, while
                 # Athena SQL and ListTableMetadata support longer table names.
                 if len(table_name) > 128:
-                    expression = re.escape(str(name))
+                    expression = re.escape(name)
                     # ListTableMetadata limits its regex filter to 256 characters.
                     # Unusual catalog names can exceed that after regex escaping.
-                    for metadata in cursor.list_table_metadata(
+                    listed = cursor.list_table_metadata(
                         schema_name=schema,
                         expression=expression if len(expression) <= 256 else None,
                         logging_=False,
-                    ):
-                        if metadata.name == name:
-                            break
-                    else:
+                    )
+                    metadata = next((m for m in listed if m.name == name), None)
+                    if metadata is None:
                         raise exc.NoSuchTableError(table_name)
                 else:
                     metadata = cursor.get_table_metadata(
                         table_name, schema_name=schema, logging_=False
                     )
             except pyathena.error.OperationalError as e:
-                cause = e.__cause__
-                if (
-                    isinstance(cause, botocore.exceptions.ClientError)
-                    and _get_error_code(cause, unwrap_metadata=True) == "EntityNotFoundException"
+                if _get_error_code(e.__cause__ or e, unwrap_metadata=True) == (
+                    "EntityNotFoundException"
                 ):
                     raise exc.NoSuchTableError(table_name) from e
                 raise
-        if info_cache is not None:
-            info_cache[cache_key] = metadata
+        info_cache[cache_key] = metadata
         return metadata
 
     def _get_tables(self, connection, schema: str | None = None, **kw):
         raw_connection = self._raw_connection(connection)
-        catalog, schema, _ = self._metadata_identity(raw_connection, None, schema)
+        catalog = self._cursor_option(raw_connection, "catalog_name")
+        schema = schema if schema else raw_connection.schema_name  # type: ignore[union-attr]
         info_cache = kw.get("info_cache")
+        if info_cache is None:
+            info_cache = {}
         cache_key = ("pyathena_table_metadata_list", catalog, schema)
-        if info_cache is not None and cache_key in info_cache:
-            return info_cache[cache_key]
+        tables = info_cache.get(cache_key)
+        if tables is not None:
+            return tables
         with raw_connection.driver_connection.cursor() as cursor:  # type: ignore[union-attr]
             tables = cursor.list_table_metadata(schema_name=schema)
-        if info_cache is not None:
-            info_cache[cache_key] = tables
-            for metadata in tables:
-                name = metadata.name
-                if name is not None and (catalog or "").lower() == "awsdatacatalog":
-                    name = name.lower()
-                # Preserve earlier reflection results until Inspector.clear_cache().
-                info_cache.setdefault(("pyathena_table_metadata", catalog, schema, name), metadata)
+        info_cache[cache_key] = tables
+        for metadata in tables:
+            if metadata.name is None:
+                continue
+            name = self._fold_table_name(catalog, metadata.name)
+            # Preserve earlier reflection results until Inspector.clear_cache().
+            info_cache.setdefault(("pyathena_table_metadata", catalog, schema, name), metadata)
         return tables
 
     def get_schema_names(self, connection, **kw):
@@ -395,21 +381,15 @@ class AthenaDialect(DefaultDialect):
 
     @reflection.cache
     def has_table(self, connection: Connection, table_name: str, schema: str | None = None, **kw):
+        raw_connection = self._raw_connection(connection)
         try:
-            columns = self.get_columns(connection, table_name, schema, **kw)
-            return bool(columns)
+            metadata = self._get_table(connection, table_name, schema=schema, **kw)
+            return bool(metadata.columns or metadata.partition_keys)
         except exc.NoSuchTableError:
             return False
         except pyathena.error.OperationalError as e:
-            cause = e.__cause__
-            raw_connection = self._raw_connection(connection)
-            retry_config = raw_connection.cursor_kwargs.get(
-                "retry_config", raw_connection.retry_config
-            )
-            if not (
-                isinstance(cause, botocore.exceptions.ClientError)
-                and is_retryable_error(cause, retry_config)
-            ):
+            retry_config = self._cursor_option(raw_connection, "retry_config")
+            if not is_retryable_error(e.__cause__ or e, retry_config):
                 raise
             # The metadata API is still throttled after PyAthena's retries.
             # Existence can be answered by a query; column, comment and option
@@ -418,13 +398,11 @@ class AthenaDialect(DefaultDialect):
                 f"Table metadata request for {table_name} was throttled; "
                 "checking existence with information_schema."
             )
-            return self._has_table_information_schema(connection, table_name, schema)
+            schema = schema if schema else raw_connection.schema_name  # type: ignore[union-attr]
+            return self._has_table_information_schema(connection, str(table_name), str(schema))
 
-    def _has_table_information_schema(
-        self, connection: Connection, table_name: str, schema: str | None = None
-    ) -> bool:
-        raw_connection = self._raw_connection(connection)
-        _, schema, name = self._metadata_identity(raw_connection, table_name, schema)
+    @staticmethod
+    def _has_table_information_schema(connection: Connection, table_name: str, schema: str) -> bool:
         # Athena resolves identifiers case-insensitively, so compare names the
         # same way regardless of how the catalog reports them.
         query = text(
@@ -432,7 +410,7 @@ class AthenaDialect(DefaultDialect):
             "WHERE lower(table_schema) = :schema AND lower(table_name) = :table_name"
         )
         rows = connection.execute(
-            query, {"schema": str(schema).lower(), "table_name": str(name).lower()}
+            query, {"schema": schema.lower(), "table_name": table_name.lower()}
         ).fetchall()
         return bool(rows)
 

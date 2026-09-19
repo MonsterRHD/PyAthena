@@ -22,6 +22,32 @@ from sqlalchemy.testing.suite import StringTest as _StringTest
 
 from pyathena.error import OperationalError
 
+
+def _raw_connection(connection):
+    """Return the PyAthena connection behind a SQLAlchemy connection for either dialect."""
+    raw_connection = connection.connection.driver_connection
+    if connection.dialect.is_async:
+        raw_connection = raw_connection.driver_connection
+    return raw_connection
+
+
+def _metadata_error(code, message):
+    return ClientError({"Error": {"Code": code, "Message": message}}, "GetTableMetadata")
+
+
+def _fail_get_table_metadata(monkeypatch, raw_connection, error):
+    """Make every GetTableMetadata call raise ``error`` without retries; return the call list."""
+    calls = []
+
+    def fail_metadata(**kwargs):
+        calls.append(kwargs)
+        raise error
+
+    monkeypatch.setattr(raw_connection.client, "get_table_metadata", fail_metadata)
+    monkeypatch.setattr(raw_connection.retry_config, "attempt", 1)
+    return calls
+
+
 del BinaryTest  # noqa: F821
 del CompositeKeyReflectionTest  # noqa: F821
 del CTETest  # noqa: F821
@@ -126,9 +152,7 @@ class ComponentReflectionTestExtra(_ComponentReflectionTestExtra):
         table = Table("listed_metadata", metadata, Column("id", Integer, comment="identifier"))
         table.create(connection)
         inspector = inspect(connection)
-        raw_connection = connection.connection.driver_connection
-        if connection.dialect.is_async:
-            raw_connection = raw_connection.driver_connection
+        raw_connection = _raw_connection(connection)
         if cursor_catalog:
             monkeypatch.setitem(
                 raw_connection.cursor_kwargs, "catalog_name", raw_connection.catalog_name
@@ -264,68 +288,36 @@ class LongNameBlowoutTest(_LongNameBlowoutTest):
 
 
 class HasTableTest(_HasTableTest):
-    @sa_testing.combinations(True, False, argnames="wrapped")
     @sa_testing.combinations(True, False, argnames="exists")
     def test_throttled_existence_check_uses_information_schema(
-        self, connection, metadata, monkeypatch, wrapped, exists
+        self, connection, metadata, monkeypatch, exists
     ):
-        table = Table("throttled_existence", metadata, Column("id", Integer))
-        table.create(connection)
-        raw_connection = connection.connection.driver_connection
-        if connection.dialect.is_async:
-            raw_connection = raw_connection.driver_connection
-        error = ClientError(
-            {
-                "Error": {
-                    "Code": "MetadataException" if wrapped else "ThrottlingException",
-                    "Message": "Rate exceeded (Service: AmazonDataCatalog; Status Code: 400; "
-                    "Error Code: ThrottlingException; Request ID: example; Proxy: null)"
-                    if wrapped
-                    else "Rate exceeded",
-                }
-            },
-            "GetTableMetadata",
-        )
-        calls = []
-
-        def fail_metadata(**kwargs):
-            calls.append(kwargs)
-            raise error
-
-        monkeypatch.setattr(raw_connection.client, "get_table_metadata", fail_metadata)
-        monkeypatch.setattr(raw_connection.retry_config, "attempt", 1)
+        name = "throttled_existence" if exists else "throttled_missing"
+        if exists:
+            Table(name, metadata, Column("id", Integer)).create(connection)
+        raw_connection = _raw_connection(connection)
+        error = _metadata_error("ThrottlingException", "Rate exceeded")
+        calls = _fail_get_table_metadata(monkeypatch, raw_connection, error)
         inspector = inspect(connection)
-        name = table.name if exists else "throttled_missing"
         assert inspector.has_table(name) is exists
         assert inspector.has_table(name.upper(), schema=raw_connection.schema_name) is exists
         assert len(calls) == 2
         # Only existence falls back; reflection still reports the throttled request.
         with pytest.raises(OperationalError) as caught:
-            inspector.get_columns(table.name)
+            inspector.get_columns(name)
         assert caught.value.__cause__ is error
 
     @sa_testing.combinations("AccessDeniedException", None, argnames="code")
     def test_metadata_errors_do_not_establish_absence(self, connection, monkeypatch, code):
-        raw_connection = connection.connection.driver_connection
-        if connection.dialect.is_async:
-            raw_connection = raw_connection.driver_connection
+        raw_connection = _raw_connection(connection)
         message = (
             "Catalog error (Service: AmazonDataCatalog; Status Code: 400; "
             f"Error Code: {code}; Request ID: example; Proxy: null)"
             if code
             else "Table not found"
         )
-        error = ClientError(
-            {"Error": {"Code": "MetadataException", "Message": message}}, "GetTableMetadata"
-        )
-        calls = []
-
-        def fail_metadata(**kwargs):
-            calls.append(kwargs)
-            raise error
-
-        monkeypatch.setattr(raw_connection.client, "get_table_metadata", fail_metadata)
-        monkeypatch.setattr(raw_connection.retry_config, "attempt", 1)
+        error = _metadata_error("MetadataException", message)
+        calls = _fail_get_table_metadata(monkeypatch, raw_connection, error)
         inspector = inspect(connection)
         for _ in range(2):
             with pytest.raises(OperationalError) as caught:

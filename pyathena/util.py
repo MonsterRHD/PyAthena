@@ -22,6 +22,12 @@ _logger = logging.getLogger(__name__)
 PATTERN_OUTPUT_LOCATION: Pattern[str] = re.compile(
     r"^s3://(?P<bucket>[a-zA-Z0-9.\-_]+)/(?P<key>.+)$"
 )
+# Athena wraps Glue errors without marking them retryable in its model.
+# Match the service error envelope, not arbitrary words in its message.
+PATTERN_METADATA_SERVICE_ERROR: Pattern[str] = re.compile(
+    r"\(Service: AmazonDataCatalog; Status Code: \d+; "
+    r"Error Code: ([A-Za-z][A-Za-z0-9]+);[^()]*\)\s*$"
+)
 
 
 def parse_output_location(output_location: str) -> tuple[str, str]:
@@ -157,15 +163,9 @@ def _get_error_code(ex: BaseException, unwrap_metadata: bool = False) -> str | N
         return None
     code = error.get("Code")
     if unwrap_metadata and code == "MetadataException":
-        # Athena wraps Glue errors without marking them retryable in its model.
-        # Match the service error envelope, not arbitrary words in its message.
         message = error.get("Message", "")
         if isinstance(message, str):
-            match = re.search(
-                r"\(Service: AmazonDataCatalog; Status Code: \d+; "
-                r"Error Code: ([A-Za-z][A-Za-z0-9]+);[^()]*\)\s*$",
-                message,
-            )
+            match = PATTERN_METADATA_SERVICE_ERROR.search(message)
             if match:
                 return match.group(1)
     return code if isinstance(code, str) else None
@@ -182,9 +182,12 @@ def is_retryable_error(ex: BaseException, config: RetryConfig) -> bool:
         True if the direct error code, or a recognized Glue error code wrapped in
         an Athena ``MetadataException``, is listed in ``config.exceptions``.
     """
-    return any(
-        code is not None and code in config.exceptions
-        for code in (_get_error_code(ex), _get_error_code(ex, unwrap_metadata=True))
+    code = _get_error_code(ex)
+    if code in config.exceptions:
+        return True
+    return (
+        code == "MetadataException"
+        and _get_error_code(ex, unwrap_metadata=True) in config.exceptions
     )
 
 

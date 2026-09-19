@@ -103,7 +103,7 @@ For failed metadata requests, only recognized `EntityNotFoundException` response
 When a table-metadata request is still throttled after PyAthena's retries, `has_table()` determines existence with a query on `information_schema.tables` and logs a warning.
 This fallback answers only existence: it does not populate the metadata cache, and column, comment, and table-option reflection still propagate the throttling error.
 Athena applies its metadata API rate limits per account, and they are not listed in Service Quotas.
-PyAthena's API retries use exponential backoff with uniform jitter; the default `RetryConfig` makes seven attempts whose waits sum to 63 seconds plus jitter.
+PyAthena's API retries use exponential backoff with uniform jitter; `RetryConfig` documents the default attempt count and waits.
 PyAthena recognizes Glue error codes in Athena's `MetadataException` service-error envelope and applies `RetryConfig.exceptions` to those codes.
 `RetryConfig` accepts one exception-name string or an iterable and captures the names as a tuple at construction.
 Changes to the original input list or iterator no longer change the stored policy; construct a new `RetryConfig` when changing the retry policy.
