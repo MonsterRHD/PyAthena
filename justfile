@@ -15,11 +15,12 @@ format:
     uvx ruff@{{RUFF_VERSION}} check --select I --fix .
     uvx ruff@{{RUFF_VERSION}} format .
 
-# Lint + format check + mypy
+# Lint, format check, mypy, and CloudFormation validation
 lint:
     uvx ruff@{{RUFF_VERSION}} check .
     uvx ruff@{{RUFF_VERSION}} format --check .
     uv run mypy .
+    uv run cfn-lint cloudformation/*.yaml
 
 # Run tests: just test (pyathena|sqla|sqla-async)
 test target="help":

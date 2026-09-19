@@ -8,6 +8,12 @@ See the [testing guide](../docs/testing.md#github-actions) for initial stack cre
 
 The benchmark-specific template is maintained separately in [benchmarks/cloudformation/](../benchmarks/cloudformation/).
 
+## Validation
+
+Run `just lint` from the repository root to check the templates in this directory with cfn-lint alongside the Python checks.
+This validation requires no AWS credentials.
+The benchmark template is checked separately by `just benchmark lint`.
+
 ## Update an existing stack
 
 Use the AWS CLI locally with credentials that can update the stack and its resources.

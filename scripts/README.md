@@ -6,7 +6,7 @@ AWS test infrastructure templates are in [cloudformation/](../cloudformation/).
 
 ## Validation
 
-Run the Python checks, ShellCheck, actionlint, and offline script tests from the repository root:
+Run the Python and CloudFormation checks, ShellCheck, actionlint, and offline script tests from the repository root:
 
 ```bash
 mise install shellcheck actionlint
