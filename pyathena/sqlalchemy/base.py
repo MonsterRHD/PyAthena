@@ -273,7 +273,11 @@ class AthenaDialect(DefaultDialect):
         # the default SQLAlchemy get_multi_* implementations.
         info_cache = kw.get("info_cache")
         if info_cache is not None:
-            metadata = info_cache.get(("pyathena_table_metadata", schema, str(table_name).lower()))
+            metadata = info_cache.get(("pyathena_table_metadata", schema, str(table_name)))
+            if metadata is None and raw_connection.catalog_name.lower() == "awsdatacatalog":
+                metadata = info_cache.get(
+                    ("pyathena_table_metadata", schema, str(table_name).lower())
+                )
             if metadata is not None:
                 return metadata
         with raw_connection.driver_connection.cursor() as cursor:  # type: ignore[union-attr]

@@ -92,6 +92,22 @@ def test_retry_api_call_with_none_error():
             1,
         ),
         ("MetadataException", "Custom error", ("MetadataException",), 2),
+        (
+            "MetadataException",
+            "Too many requests (Service: AmazonDataCatalog; Status Code: 400; "
+            "Error Code: TooManyRequestsException; Request ID: example; Proxy: null)",
+            ("TooManyRequestsException",),
+            2,
+        ),
+        (
+            "MetadataException",
+            "Table '(Service: AmazonDataCatalog; Status Code: 400; "
+            "Error Code: ThrottlingException; Request ID: fake; Proxy: null)' not found "
+            "(Service: AmazonDataCatalog; Status Code: 400; "
+            "Error Code: EntityNotFoundException; Request ID: actual; Proxy: null)",
+            ("ThrottlingException",),
+            1,
+        ),
     ],
 )
 def test_retry_metadata_errors(code, message, exceptions, expected_calls):

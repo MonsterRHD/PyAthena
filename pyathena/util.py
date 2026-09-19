@@ -148,7 +148,7 @@ def _get_error_code(ex: BaseException, unwrap_metadata: bool = False) -> str | N
         if isinstance(message, str):
             match = re.search(
                 r"\(Service: AmazonDataCatalog; Status Code: \d+; "
-                r"Error Code: ([A-Za-z][A-Za-z0-9]+);",
+                r"Error Code: ([A-Za-z][A-Za-z0-9]+);[^()]*\)\s*$",
                 message,
             )
             if match:
