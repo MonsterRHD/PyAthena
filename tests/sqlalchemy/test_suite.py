@@ -115,7 +115,8 @@ class ComponentReflectionTest(_ComponentReflectionTest):
 
 
 class ComponentReflectionTestExtra(_ComponentReflectionTestExtra):
-    def test_reuses_listed_table_metadata(self, connection, metadata):
+    @sa_testing.combinations(True, False, argnames="list_first")
+    def test_reuses_table_metadata(self, connection, metadata, list_first):
         table = Table("listed_metadata", metadata, Column("id", Integer, comment="identifier"))
         table.create(connection)
         inspector = inspect(connection)
@@ -130,12 +131,31 @@ class ComponentReflectionTestExtra(_ComponentReflectionTestExtra):
 
         client.meta.events.register("before-call.athena", record_call)
         try:
-            assert table.name in inspector.get_table_names()
+            schema = raw_connection.schema_name
+            if list_first:
+                assert table.name in inspector.get_table_names()
+                listed_calls = list(calls)
+                assert table.name in inspector.get_table_names(schema=schema)
+                assert table.name not in inspector.get_view_names(schema=schema)
+                assert calls == listed_calls
             assert inspector.get_columns(table.name)[0]["comment"] == "identifier"
-            assert inspector.get_table_options(table.name)["awsathena_location"]
-            assert inspector.has_table(table.name)
-            assert "ListTableMetadata" in calls
-            assert "GetTableMetadata" not in calls
+            initial_calls = list(calls)
+            assert inspector.get_columns(table.name, schema=schema)[0]["name"] == "id"
+            assert inspector.get_table_options(table.name, schema=schema)["awsathena_location"]
+            assert inspector.get_table_comment(table.name, schema=schema) == {"text": None}
+            assert inspector.has_table(table.name.upper(), schema=schema)
+            assert calls == initial_calls
+            if list_first:
+                assert "ListTableMetadata" in calls
+                assert "GetTableMetadata" not in calls
+                assert (
+                    inspector.get_multi_columns(schema=schema, filter_names=[table.name])[
+                        (schema, table.name)
+                    ][0]["name"]
+                    == "id"
+                )
+                assert calls == initial_calls
+            calls.clear()
             inspector.clear_cache()
             assert inspector.get_columns(table.name)[0]["name"] == "id"
             # A fresh lookup may retry when Athena throttles metadata requests.
@@ -143,6 +163,9 @@ class ComponentReflectionTestExtra(_ComponentReflectionTestExtra):
             assert metadata_calls > 0
             assert inspector.get_columns(table.name)[0]["name"] == "id"
             assert calls.count("GetTableMetadata") == metadata_calls
+            if list_first:
+                assert table.name in inspector.get_table_names(schema=schema)
+                assert "ListTableMetadata" in calls
         finally:
             client.meta.events.unregister("before-call.athena", record_call)
 

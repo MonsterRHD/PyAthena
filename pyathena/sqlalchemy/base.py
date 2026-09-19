@@ -264,20 +264,17 @@ class AthenaDialect(DefaultDialect):
                     return []
                 raise
 
-    @reflection.cache
     def _get_table(self, connection, table_name: str, schema: str | None = None, **kw):
         raw_connection = self._raw_connection(connection)
         schema = schema if schema else raw_connection.schema_name  # type: ignore[union-attr]
-        # ListTableMetadata already includes columns and table properties.
-        # Reuse positive results within this Inspector's cache, including for
-        # the default SQLAlchemy get_multi_* implementations.
+        catalog = raw_connection.catalog_name
+        name = str(table_name).lower() if catalog.lower() == "awsdatacatalog" else str(table_name)
+        # Key by the metadata request, not the reflection method's arguments.
+        # Listings and individual lookups share positive results in this Inspector.
         info_cache = kw.get("info_cache")
+        cache_key = ("pyathena_table_metadata", catalog, schema, name)
         if info_cache is not None:
-            metadata = info_cache.get(("pyathena_table_metadata", schema, str(table_name)))
-            if metadata is None and raw_connection.catalog_name.lower() == "awsdatacatalog":
-                metadata = info_cache.get(
-                    ("pyathena_table_metadata", schema, str(table_name).lower())
-                )
+            metadata = info_cache.get(cache_key)
             if metadata is not None:
                 return metadata
         with raw_connection.driver_connection.cursor() as cursor:  # type: ignore[union-attr]
@@ -295,9 +292,13 @@ class AthenaDialect(DefaultDialect):
                         logging_=False,
                     ):
                         if metadata.name == name:
-                            return metadata
-                    raise exc.NoSuchTableError(table_name)
-                return cursor.get_table_metadata(table_name, schema_name=schema, logging_=False)
+                            break
+                    else:
+                        raise exc.NoSuchTableError(table_name)
+                else:
+                    metadata = cursor.get_table_metadata(
+                        table_name, schema_name=schema, logging_=False
+                    )
             except pyathena.error.OperationalError as e:
                 cause = e.__cause__
                 if (
@@ -306,17 +307,27 @@ class AthenaDialect(DefaultDialect):
                 ):
                     raise exc.NoSuchTableError(table_name) from e
                 raise
+        if info_cache is not None:
+            info_cache[cache_key] = metadata
+        return metadata
 
-    @reflection.cache
     def _get_tables(self, connection, schema: str | None = None, **kw):
         raw_connection = self._raw_connection(connection)
         schema = schema if schema else raw_connection.schema_name  # type: ignore[union-attr]
+        catalog = raw_connection.catalog_name
+        info_cache = kw.get("info_cache")
+        cache_key = ("pyathena_table_metadata_list", catalog, schema)
+        if info_cache is not None and cache_key in info_cache:
+            return info_cache[cache_key]
         with raw_connection.driver_connection.cursor() as cursor:  # type: ignore[union-attr]
             tables = cursor.list_table_metadata(schema_name=schema)
-        info_cache = kw.get("info_cache")
         if info_cache is not None:
+            info_cache[cache_key] = tables
             for metadata in tables:
-                info_cache[("pyathena_table_metadata", schema, metadata.name)] = metadata
+                name = metadata.name
+                if name is not None and catalog.lower() == "awsdatacatalog":
+                    name = name.lower()
+                info_cache[("pyathena_table_metadata", catalog, schema, name)] = metadata
         return tables
 
     def get_schema_names(self, connection, **kw):
