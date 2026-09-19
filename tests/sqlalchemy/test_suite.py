@@ -149,8 +149,9 @@ class HasTableTest(_HasTableTest):
         assert inspector.has_table(table.name, schema=schema)
 
     @sa_testing.requires.schemas
-    def test_has_table_cache_schema(self, connection, metadata):
-        table = Table("cache_schema", metadata, Column("id", Integer))
+    @sa_testing.combinations(12, 129, argnames="length")
+    def test_has_table_cache_schema(self, connection, metadata, length):
+        table = Table("cache_schema".ljust(length, "t"), metadata, Column("id", Integer))
         other = Table(
             table.name,
             metadata,
@@ -194,6 +195,10 @@ class IdentifierReflectionTest(fixtures.TestBase):
         table = Table("t" * length, metadata, Column("c" * 255, Integer))
         inspector = inspect(connection)
         assert not inspector.has_table(table.name)
+        missing_schema = f"{sa_testing.config.test_schema}_missing"
+        assert not inspector.has_table(table.name, schema=missing_schema)
+        with pytest.raises(sa_exc.NoSuchTableError):
+            inspector.get_columns(table.name, schema=missing_schema)
         table.create(connection)
         connection.execute(table.insert().values({"c" * 255: 1}))
         assert connection.execute(select(table)).scalar_one() == 1
