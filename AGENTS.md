@@ -13,9 +13,17 @@ PyAthena is a Python DB API 2.0 (PEP 249) compliant client for Amazon Athena. Se
 - Use a dedicated worktree for each PR and follow the repository's PR template.
 - For PR delivery, follow [development-workflow](.agents/skills/development-workflow/SKILL.md): create the draft, complete two distinct self-reviews, collect an independent review, and check current CI before Ready.
 - Run [self-review](.agents/skills/self-review/SKILL.md) for behavior and implementation, then [self-review-round-two](.agents/skills/self-review-round-two/SKILL.md) for compatibility, operational consequences, and factual claims.
+- Follow [independent-review](.agents/skills/independent-review/SKILL.md) after both rounds; Codex-authored changes use Claude Code `claude-fable-5-1`, profile `max`, effort `high`, never Enterprise.
 - Record review findings and outcomes inline on relevant diff lines using the GitHub review API's `comments` array with an empty review body.
 - Use `gh` for GitHub operations, and write commits, PR text, and review comments in English.
 - A review-only request keeps its specified scope and side-effect limits; it does not start PR delivery.
+
+### Agent Skill Entry Points
+
+The canonical skill definitions live in `.agents/skills/`.
+Claude Code loads the same definitions through linked `SKILL.md` files under `.claude/skills/`; `CLAUDE.md` also links to this guide.
+Use `/development-workflow`, `/self-review`, `/self-review-round-two`, or `/independent-review` in Claude Code.
+Edit the canonical files when maintaining these skills so both agents use the same procedure.
 
 ### Import Rules
 

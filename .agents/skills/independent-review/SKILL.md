@@ -8,7 +8,14 @@ description: Obtain and collect an independent read-only review of a PyAthena PR
 Use the scope and evidence rules in [development-workflow](../development-workflow/SKILL.md).
 Choose an available reviewer that did not author the change, including its repairs: a different model or a human.
 A fresh thread of the authoring model does not satisfy this distinction.
-Honor the user's chosen provider, account/profile, model, and effort rather than hardcoding a personal machine path or product version into this project.
+For a Codex-authored change, use Claude Code with model `claude-fable-5-1`, the `max` profile, and effort `high`.
+Do not use an Enterprise account for this review.
+Resolve the locally configured `max` profile without committing a personal filesystem path, and verify the selected account/profile before sending review content.
+An API key or provider environment override must not silently route the review through a different account.
+When the profile uses `CLAUDE_CONFIG_DIR`, set it to the resolved `max` directory and check `claude auth status` for first-party Max authentication before launch.
+Use the Claude Code CLI directly; a Flink repository plugin is not a prerequisite.
+For a Claude-authored change, use a different model or a human; a second Claude session is still self-review.
+An explicit user override takes precedence over these defaults.
 Existing authorization applies within its scope; this skill does not authorize unrelated external disclosure or contacting other people.
 
 ## Provide a bounded review package

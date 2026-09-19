@@ -50,6 +50,7 @@ Before a live AWS run or CI retry, inspect active Test workflows with `gh run li
 Separate worktrees do not isolate AWS accounts, quotas, or shared test resources.
 When runs overlap, serialize live validation and use targeted `-n 1` runs while iterating; complete the required suite coverage before Ready.
 Use `just worktree-env` and `uv run --env-file .env pytest ...` to load the worktree environment without printing credentials.
+For a full recipe, use `uv run --env-file .env just test sqla` (or `sqla-async`); linking `.env` alone does not export its variables to `just`.
 Do not cancel someone else's run or increase retry limits merely to obtain green CI.
 After a failure, identify the failing API, error, retry layer, and run before deciding whether a retry is informative.
 Markdown-only changes need no live AWS tests; inspect the actual workflow path filters when interpreting absent jobs.
@@ -75,6 +76,7 @@ Record each round separately: perspective, full base/head SHAs, covered surfaces
 Publish review records as inline comments on relevant diff lines through `gh api repos/OWNER/REPO/pulls/NUMBER/reviews`, using a `comments` array and an empty review body.
 Use `event: COMMENT`, not approval of your own PR, and store the JSON request in a temporary file passed with `--input`.
 For a clean round, anchor its evidence to a relevant changed line; reply to an existing finding when recording its repair.
+For a finding outside the diff, anchor to the related changed line and name the actual `file:line` in the comment; GitHub rejects line anchors outside the diff.
 If the user's review-only scope prohibits posting, keep the result in the response instead.
 
 This workflow takes its review sequence and scope tracking from the [flink-connector-gcp skills at aad72cd8](https://github.com/flink-gcp/flink-connector-gcp/tree/aad72cd8e52cec7bdb25c958bf61dc820a549054/.agents/skills), with PyAthena-specific review and validation guidance.
