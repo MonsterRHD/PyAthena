@@ -100,6 +100,8 @@ Metadata throttling and permission errors remain errors rather than being report
 `has_table()` propagates these failures, including access denied by Lake Formation, instead of returning or caching `False`.
 Only recognized `EntityNotFoundException` responses establish absence; unrecognized metadata errors are propagated rather than guessed to mean a missing table.
 PyAthena recognizes Glue error codes in Athena's `MetadataException` service-error envelope and applies `RetryConfig.exceptions` to those codes.
+`RetryConfig` accepts one exception-name string or an iterable and captures the names as a tuple at construction.
+Changes to the original input list or iterator no longer change the stored policy; construct a new `RetryConfig` when changing the retry policy.
 SDK retries and PyAthena retries are separate layers, so increasing both attempt limits can multiply requests and waiting time.
 Adaptive SDK retries regulate individual clients, not the aggregate traffic from independent CI runners.
 

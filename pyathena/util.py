@@ -111,6 +111,9 @@ class RetryConfig:
         ... )
 
     Note:
+        Exception names may be supplied as a single string or an iterable.
+        They are captured as a tuple at construction; later changes to the
+        original iterable do not change this configuration.
         Retries are applied to AWS API calls, not to SQL query execution.
         Query failures typically require manual intervention or query fixes.
         Recognized Glue error codes wrapped in Athena MetadataException are
@@ -128,7 +131,7 @@ class RetryConfig:
         max_delay: int = 100,
         exponential_base: int = 2,
     ) -> None:
-        self.exceptions = tuple(exceptions)
+        self.exceptions = (exceptions,) if isinstance(exceptions, str) else tuple(exceptions)
         self.attempt = attempt
         self.multiplier = multiplier
         self.max_delay = max_delay

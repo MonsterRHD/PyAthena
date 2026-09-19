@@ -132,7 +132,8 @@ def test_retry_metadata_errors(code, message, exceptions, expected_calls):
 
 
 @pytest.mark.parametrize("wrapped", [False, True])
-def test_retry_api_call_with_single_pass_exceptions(wrapped):
+@pytest.mark.parametrize("policy_type", [tuple, list, iter, str])
+def test_retry_api_call_with_reusable_exception_policy(wrapped, policy_type):
     error = ClientError(
         {
             "Error": {
@@ -143,9 +144,10 @@ def test_retry_api_call_with_single_pass_exceptions(wrapped):
         },
         "GetTableMetadata",
     )
-    config = RetryConfig(
-        exceptions=iter(("ThrottlingException",)), attempt=3, multiplier=0, max_delay=0
+    exceptions = (
+        "ThrottlingException" if policy_type is str else policy_type(("ThrottlingException",))
     )
+    config = RetryConfig(exceptions=exceptions, attempt=3, multiplier=0, max_delay=0)
     for _ in range(2):
         calls = 0
 
