@@ -124,6 +124,34 @@ class NativeArrayTest(fixtures.TestBase):
     __backend__ = True
     __requires__ = ("array_type",)
 
+    def test_native_ordering(self, connection, metadata):
+        table = Table(
+            "native_array_order",
+            metadata,
+            Column("id", Integer),
+            Column("value", AthenaArray(Integer)),
+        )
+        table.create(connection)
+        connection.execute(
+            table.insert(),
+            [{"id": 1, "value": [10]}, {"id": 2, "value": [2]}, {"id": 3, "value": [2]}],
+        )
+        value = table.c.value.label("items")
+        for ordering in (value, "items"):
+            stmt = select(value).distinct().order_by(ordering)
+            eq_(connection.execute(stmt).scalars().all(), [[2], [10]])
+        eq_(
+            connection.execute(select(value).order_by(table.c.id.desc()).limit(2)).scalars().all(),
+            [[2], [2]],
+        )
+        union = (
+            select(table.c.value)
+            .where(table.c.id == 1)
+            .union_all(select(table.c.value).where(table.c.id == 2))
+            .order_by("value")
+        )
+        eq_(connection.execute(union).scalars().all(), [[2], [10]])
+
     def test_reflection_and_executemany(self, connection, metadata):
         table = Table(
             "native_array_values",

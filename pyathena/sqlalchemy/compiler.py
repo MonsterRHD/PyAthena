@@ -3,14 +3,22 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, cast
 
-from sqlalchemy import exc, types, util
+from sqlalchemy import exc, select, types, util
+from sqlalchemy.sql import operators, visitors
+from sqlalchemy.sql import util as sql_util
 from sqlalchemy.sql.compiler import (
     DDLCompiler,
     GenericTypeCompiler,
     IdentifierPreparer,
     SQLCompiler,
 )
-from sqlalchemy.sql.elements import BindParameter, Cast
+from sqlalchemy.sql.elements import (
+    BindParameter,
+    Cast,
+    UnaryExpression,
+    _label_reference,
+    _textual_label_reference,
+)
 from sqlalchemy.sql.schema import Column
 
 from pyathena.model import (
@@ -242,6 +250,80 @@ class AthenaStatementCompiler(SQLCompiler):
 
     def visit_char_length_func(self, fn: Function[Any], **kw: Any) -> str:
         return f"length{self.function_argspec(fn, **kw)}"
+
+    def translate_select_structure(self, select_stmt, **kw):
+        """Keep DISTINCT and ordering on native arrays before result serialization."""
+        if (
+            not self.stack
+            and not kw.get("asfrom")
+            and (select_stmt._distinct or select_stmt._order_by_clauses)
+            and any(isinstance(column.type, types.ARRAY) for column in select_stmt.selected_columns)
+        ):
+            return self._array_result_select(select_stmt)
+        return select_stmt
+
+    def visit_compound_select(self, cs, asfrom=False, compound_index=None, **kw):
+        if (
+            not self.stack
+            and not asfrom
+            and any(isinstance(column.type, types.ARRAY) for column in cs.selected_columns)
+        ):
+            original_columns = list(cs.selected_columns)
+            rendered = self.process(self._array_result_select(cs), **kw)
+            self._result_columns = [
+                entry._replace(objects=(*entry.objects, original))
+                for entry, original in zip(self._result_columns, original_columns, strict=True)
+            ]
+            return rendered
+        return super().visit_compound_select(cs, asfrom=asfrom, compound_index=compound_index, **kw)
+
+    def _array_result_select(self, statement):
+        columns = list(statement.selected_columns)
+        inner = statement.order_by(None).limit(None).offset(None)
+        ordering = []
+        hidden: list[Any] = []
+
+        def resolve_label(element: Any, **kw: Any) -> Any:
+            if isinstance(element, _textual_label_reference):
+                return statement.selected_columns[element.element]
+            if isinstance(element, _label_reference):
+                return element.element
+            return None
+
+        for clause in statement._order_by_clauses:
+            clause = visitors.replacement_traverse(clause, {}, resolve_label)
+            modifiers = []
+            while isinstance(clause, UnaryExpression) and clause.modifier in (
+                operators.asc_op,
+                operators.desc_op,
+                operators.nulls_first_op,
+                operators.nulls_last_op,
+            ):
+                modifiers.append(clause.modifier)
+                clause = clause.element
+            index = next((i for i, column in enumerate(columns) if column.compare(clause)), None)
+            if index is None and hasattr(inner, "add_columns") and not inner._distinct:
+                name = f"_pyathena_order_{len(hidden)}"
+                while name in statement.selected_columns:
+                    name += "_"
+                hidden.append(clause.label(name))
+                index = len(columns) + len(hidden) - 1
+            ordering.append((clause, index, modifiers))
+
+        if hidden:
+            inner = inner.add_columns(*hidden)
+        source = inner.subquery()
+        outer = select(*list(source.c)[: len(columns)])
+        adapter = sql_util.ClauseAdapter(source)
+        for clause, index, modifiers in ordering:
+            expression = source.c[index] if index is not None else adapter.traverse(clause)
+            for modifier in reversed(modifiers):
+                expression = UnaryExpression(expression, modifier=modifier)
+            outer = outer.order_by(expression)
+        outer = outer.offset(statement._offset_clause)
+        if statement._fetch_clause is not None:
+            return outer.fetch(statement._fetch_clause, **statement._fetch_clause_options)
+        return outer.limit(statement._limit_clause)
 
     def visit_filter_func(self, fn: Function[Any], **kw: Any) -> str:
         """Compile Athena filter() function with lambda expressions.
