@@ -1,8 +1,7 @@
 [aws]
 region = "us-west-2"
 workgroup = "pyathena"
-# Omit profile on EC2 to use its instance role.
-# profile = "pyathena"
+# Leave profile unset to use AWS_PROFILE locally or the instance role on EC2.
 
 [source]
 database = "pyathena_benchmark"

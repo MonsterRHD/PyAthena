@@ -11,14 +11,20 @@ The benchmark-specific template is maintained separately in [benchmarks/cloudfor
 ## Update an existing stack
 
 Use the AWS CLI locally with credentials that can update the stack and its resources.
-Run these commands from the repository root, replacing `your-aws-profile` with the profile for the test account.
+Run these commands from the repository root with [uv](https://docs.astral.sh/uv/) installed.
+Configure the test account profile and region in the gitignored `.env` file using `KEY=value` assignments:
+
+```dotenv
+AWS_PROFILE=your-aws-profile
+AWS_DEFAULT_REGION=us-west-2
+```
+
+In a git worktree, run `just worktree-env` once to link the main checkout's `.env`.
+The `uv run --env-file .env` prefix loads this configuration for each AWS command.
 Adjust the region and stack name if the stack was created with different settings.
 
 ```bash
-export AWS_PROFILE=your-aws-profile
-export AWS_DEFAULT_REGION=us-west-2
-
-aws cloudformation describe-stacks \
+uv run --env-file .env aws cloudformation describe-stacks \
   --stack-name github-actions-oidc-pyathena \
   --query 'Stacks[0].{Id:StackId,Status:StackStatus,Parameters:Parameters}'
 ```
@@ -26,7 +32,7 @@ aws cloudformation describe-stacks \
 Check the selected stack and its current parameters, then apply the local template:
 
 ```bash
-aws cloudformation deploy \
+uv run --env-file .env aws cloudformation deploy \
   --stack-name github-actions-oidc-pyathena \
   --template-file cloudformation/github_actions_oidc.yaml \
   --capabilities CAPABILITY_NAMED_IAM \
@@ -40,6 +46,6 @@ An unchanged template and parameters produce a successful no-op.
 If an update fails, inspect the stack events:
 
 ```bash
-aws cloudformation describe-stack-events \
+uv run --env-file .env aws cloudformation describe-stack-events \
   --stack-name github-actions-oidc-pyathena
 ```

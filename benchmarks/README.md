@@ -46,12 +46,22 @@ The benchmark lock includes metadata for its editable parent dependency; CI inte
 
 Commands below run from `benchmarks/`.
 `plan` and `report` do not contact AWS.
-For local AWS access, insert `--profile pyathena` before the subcommand, or set `AWS_PROFILE=pyathena`.
-On EC2, omit the profile and use the instance role.
+For local AWS access, configure the profile and region in the repository root's gitignored `.env` file:
+
+```dotenv
+AWS_PROFILE=your-aws-profile
+AWS_DEFAULT_REGION=us-west-2
+```
+
+Use `KEY=value` assignments and prefix local commands with `uv run --env-file ../.env` from `benchmarks/`.
+In a git worktree, run `just worktree-env` from the repository root once to link its `.env`.
+Leave the benchmark's `--profile` option and `[aws].profile` setting unset to use `AWS_PROFILE`.
+The harness still reads its region and workgroup from `config.toml`; keep these aligned with the target stack.
+On EC2, use the instance role and the commands shown below without loading the local `.env`.
 
 ```bash
 cd benchmarks
-uv run --locked python -m pyathena_bench plan --suite single --scale small
+uv run --env-file ../.env --locked python -m pyathena_bench plan --suite single --scale small
 ```
 
 Review the case count before running a suite.
@@ -80,23 +90,21 @@ Bootstrap checks out that commit, installs pinned uv and Python versions, and ru
 It signals setup completion to CloudFormation but does not prepare data or start measurements.
 The EC2 commands use `--no-sync` to reuse this verified environment; they do not revalidate the lockfile on every invocation.
 
-From the local checkout, replace the commit below with the implementation commit:
+From the local checkout's `benchmarks/` directory, replace the commit below with the implementation commit:
 
 ```bash
-export AWS_PROFILE=pyathena
-export AWS_DEFAULT_REGION=us-west-2
 BENCHMARK_STACK=pyathena-benchmark-run
-BENCHMARK_COMMIT=<full-40-character-commit-sha>
-aws cloudformation deploy \
+BENCHMARK_COMMIT="<full-40-character-commit-sha>"
+uv run --env-file ../.env --locked aws cloudformation deploy \
   --stack-name "$BENCHMARK_STACK" \
   --template-file cloudformation/benchmark.yaml \
   --capabilities CAPABILITY_IAM \
   --tags Purpose=pyathena-benchmark \
   --parameter-overrides GitCommit="$BENCHMARK_COMMIT"
-aws cloudformation describe-stacks --stack-name "$BENCHMARK_STACK"
-BENCHMARK_INSTANCE=$(aws cloudformation describe-stacks --stack-name "$BENCHMARK_STACK" \
+uv run --env-file ../.env --locked aws cloudformation describe-stacks --stack-name "$BENCHMARK_STACK"
+BENCHMARK_INSTANCE=$(uv run --env-file ../.env --locked aws cloudformation describe-stacks --stack-name "$BENCHMARK_STACK" \
   --query 'Stacks[0].Outputs[?OutputKey==`InstanceId`].OutputValue | [0]' --output text)
-aws ssm start-session --target "$BENCHMARK_INSTANCE"
+uv run --env-file ../.env --locked aws ssm start-session --target "$BENCHMARK_INSTANCE"
 ```
 
 Session Manager requires the AWS CLI Session Manager plugin on the local machine.
@@ -272,24 +280,24 @@ BENCHMARK_BUCKET=$(aws cloudformation describe-stacks --stack-name "$BENCHMARK_S
 aws s3 sync results/ "s3://$BENCHMARK_BUCKET/reports/"
 ```
 
-On the local machine:
+On the local machine, from `benchmarks/`:
 
 ```bash
-BENCHMARK_BUCKET=$(aws cloudformation describe-stacks --stack-name "$BENCHMARK_STACK" \
+BENCHMARK_BUCKET=$(uv run --env-file ../.env --locked aws cloudformation describe-stacks --stack-name "$BENCHMARK_STACK" \
   --query 'Stacks[0].Outputs[?OutputKey==`Bucket`].OutputValue | [0]' --output text)
 mkdir -p results/recovered
-aws s3 sync "s3://$BENCHMARK_BUCKET/reports/" results/recovered/
-aws cloudformation describe-stacks --stack-name "$BENCHMARK_STACK" > results/recovered/stack.json
-aws ec2 describe-instances --instance-ids "$BENCHMARK_INSTANCE" > results/recovered/instance.json
+uv run --env-file ../.env --locked aws s3 sync "s3://$BENCHMARK_BUCKET/reports/" results/recovered/
+uv run --env-file ../.env --locked aws cloudformation describe-stacks --stack-name "$BENCHMARK_STACK" > results/recovered/stack.json
+uv run --env-file ../.env --locked aws ec2 describe-instances --instance-ids "$BENCHMARK_INSTANCE" > results/recovered/instance.json
 ```
 
 Verify the downloaded files before proceeding.
 For every preparation manifest, preview and then clean that run using its original configuration:
 
 ```bash
-uv run --locked python -m pyathena_bench --profile pyathena cleanup \
+uv run --env-file ../.env --locked python -m pyathena_bench cleanup \
   --manifest results/recovered/input.json
-uv run --locked python -m pyathena_bench --profile pyathena cleanup \
+uv run --env-file ../.env --locked python -m pyathena_bench cleanup \
   --manifest results/recovered/input.json --execute
 ```
 
@@ -303,15 +311,15 @@ Confirm the scratch database is empty and the only remaining S3 objects are the 
 An unexpected table or object is a reason to inspect the corresponding run before deleting anything further.
 
 ```bash
-BENCHMARK_DATABASE=$(aws cloudformation describe-stacks --stack-name "$BENCHMARK_STACK" \
+BENCHMARK_DATABASE=$(uv run --env-file ../.env --locked aws cloudformation describe-stacks --stack-name "$BENCHMARK_STACK" \
   --query 'Stacks[0].Outputs[?OutputKey==`ScratchDatabase`].OutputValue | [0]' --output text)
-aws glue get-tables --database-name "$BENCHMARK_DATABASE" --query 'TableList[].Name'
-aws s3 ls "s3://$BENCHMARK_BUCKET/" --recursive
-aws s3 rm "s3://$BENCHMARK_BUCKET/reports/" --recursive
-aws s3api list-multipart-uploads --bucket "$BENCHMARK_BUCKET"
-aws s3 ls "s3://$BENCHMARK_BUCKET/" --recursive
-aws cloudformation delete-stack --stack-name "$BENCHMARK_STACK"
-aws cloudformation wait stack-delete-complete --stack-name "$BENCHMARK_STACK"
+uv run --env-file ../.env --locked aws glue get-tables --database-name "$BENCHMARK_DATABASE" --query 'TableList[].Name'
+uv run --env-file ../.env --locked aws s3 ls "s3://$BENCHMARK_BUCKET/" --recursive
+uv run --env-file ../.env --locked aws s3 rm "s3://$BENCHMARK_BUCKET/reports/" --recursive
+uv run --env-file ../.env --locked aws s3api list-multipart-uploads --bucket "$BENCHMARK_BUCKET"
+uv run --env-file ../.env --locked aws s3 ls "s3://$BENCHMARK_BUCKET/" --recursive
+uv run --env-file ../.env --locked aws cloudformation delete-stack --stack-name "$BENCHMARK_STACK"
+uv run --env-file ../.env --locked aws cloudformation wait stack-delete-complete --stack-name "$BENCHMARK_STACK"
 ```
 
 CloudFormation can delete an S3 bucket only when it is empty.
