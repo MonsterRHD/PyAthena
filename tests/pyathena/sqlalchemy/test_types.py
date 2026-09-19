@@ -344,6 +344,17 @@ def test_array_cache_key_includes_nested_fields():
     assert hash(first._static_cache_key)
 
 
+def test_array_distinct_and_union_keep_native_ordering():
+    table = Table("arrays", MetaData(), Column("items", AthenaArray(Integer)))
+    for statement in (
+        select(table.c["items"]).distinct().order_by("items"),
+        select(table.c["items"]).union_all(select(table.c["items"])).order_by("items"),
+    ):
+        sql = str(statement.compile(dialect=AthenaDialect()))
+        assert sql.count("json_format(") == 1
+        assert "ORDER BY anon_1.items" in sql
+
+
 class TestAthenaDate:
     @pytest.mark.parametrize(
         ("value", "expected"),
