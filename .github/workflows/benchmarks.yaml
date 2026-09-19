@@ -1,0 +1,41 @@
+name: Benchmark tooling
+
+on:
+  pull_request:
+    paths:
+      - 'benchmarks/**'
+      - 'pyathena/**'
+      - 'pyproject.toml'
+      - 'justfile'
+      - '.github/workflows/benchmarks.yaml'
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    env:
+      AWS_EC2_METADATA_DISABLED: 'true'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          python-version: '3.12'
+          enable-cache: true
+          cache-dependency-glob: '**/uv.lock'
+      - uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2.81.10
+        with:
+          tool: just
+      - run: uv sync --project benchmarks --locked
+      - run: just benchmark test
+      - name: Build only the main distribution
+        run: uv build -v
+      - name: Inspect distributions and metadata
+        env:
+          BENCHMARK_DIST_DIR: ${{ github.workspace }}/dist
+        run: uv run --directory benchmarks --locked pytest tests/test_packaging.py
+      - name: Rebuild the wheel from the sdist
+        run: uv build dist/*.tar.gz --wheel --out-dir "$RUNNER_TEMP/rebuilt-wheel"

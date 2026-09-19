@@ -1,0 +1,29 @@
+[aws]
+region = "us-west-2"
+workgroup = "pyathena"
+# Omit profile on EC2 to use its instance role.
+# profile = "pyathena"
+
+[source]
+database = "pyathena_benchmark"
+table = "pypi_file_downloads"
+download_date = "2026-09-17"
+
+[scales]
+small = 10000
+medium = 100000
+large = 1000000
+xlarge = 10000000
+
+[measurement]
+warmups = 1
+repetitions = 5
+arraysizes = [100, 1000]
+chunksizes = [10000, 100000]
+concurrency = [1, 10, 50, 100]
+executor_workers = 32
+poll_interval = 1.0
+sample_interval = 0.05
+heartbeat_interval = 0.01
+timeout_seconds = 3600.0
+memory_fraction = 0.8

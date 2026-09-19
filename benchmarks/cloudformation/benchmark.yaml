@@ -1,0 +1,257 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Disposable PyAthena benchmark host and scratch storage; existing source data is read-only.
+
+Parameters:
+  GitCommit:
+    Type: String
+    AllowedPattern: '[0-9a-f]{40}'
+    Description: Full commit SHA containing the benchmark implementation.
+  InstanceType:
+    Type: String
+    Default: r7i.2xlarge
+    AllowedValues: [r7i.large, r7i.xlarge, r7i.2xlarge, r7i.4xlarge, r7i.8xlarge]
+  VolumeSize:
+    Type: Number
+    Default: 100
+    MinValue: 30
+    MaxValue: 2000
+  ImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  UvVersion:
+    Type: String
+    Default: '0.12.5'
+    AllowedPattern: '[0-9]+\.[0-9]+\.[0-9]+'
+  PythonVersion:
+    Type: String
+    Default: '3.12.14'
+    AllowedPattern: '3\.12\.[0-9]+'
+  WorkGroup:
+    Type: String
+    Default: pyathena
+    AllowedPattern: '[a-zA-Z0-9._-]+'
+  SourceBucket:
+    Type: String
+    Default: pyathena-benchmark
+    AllowedPattern: '[a-z0-9][a-z0-9.-]+[a-z0-9]'
+  SourcePrefix:
+    Type: String
+    Default: pypi_file_downloads
+    AllowedPattern: '[a-zA-Z0-9_-]+(/[a-zA-Z0-9_-]+)*'
+  SourceDatabase:
+    Type: String
+    Default: pyathena_benchmark
+    AllowedPattern: '[a-z][a-z0-9_]*'
+  SourceTable:
+    Type: String
+    Default: pypi_file_downloads
+    AllowedPattern: '[a-z][a-z0-9_]*'
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.93.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+  Gateway:
+    Type: AWS::EC2::InternetGateway
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref Gateway
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.93.0.0/24
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+  Route:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Gateway
+  RouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Subnet
+      RouteTableId: !Ref RouteTable
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Session Manager access with no inbound ports
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+  Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: abort-incomplete-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+  ScratchDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Join
+          - '_'
+          - - pyathena_bench
+            - !Join ['', !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
+        Description: Temporary benchmark inputs and Wrangler CTAS tables
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: benchmark
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [cloudformation:DescribeStacks, cloudformation:SignalResource]
+                Resource: !Ref AWS::StackId
+              - Effect: Allow
+                Action: [athena:StartQueryExecution, athena:GetQueryExecution, athena:BatchGetQueryExecution, athena:GetQueryResults,
+                         athena:StopQueryExecution, athena:ListQueryExecutions, athena:GetWorkGroup]
+                Resource: !Sub arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${WorkGroup}
+              - Effect: Allow
+                Action: [athena:GetDataCatalog, athena:GetTableMetadata]
+                Resource: !Sub arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:datacatalog/AwsDataCatalog
+              - Effect: Allow
+                Action: [glue:GetDatabase, glue:GetTable, glue:GetPartition, glue:GetPartitions, glue:BatchGetPartition]
+                Resource:
+                  - !Sub arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - !Sub arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${SourceDatabase}
+                  - !Sub arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${SourceDatabase}/${SourceTable}
+              - Effect: Allow
+                Action: [glue:GetDatabase, glue:GetTable, glue:GetTables, glue:CreateTable,
+                         glue:DeleteTable, glue:UpdateTable, glue:GetPartition, glue:GetPartitions, glue:BatchGetPartition]
+                Resource:
+                  - !Sub arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - !Sub arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${ScratchDatabase}
+                  - !Sub arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${ScratchDatabase}/*
+              - Effect: Allow
+                Action: s3:GetBucketLocation
+                Resource: !Sub arn:${AWS::Partition}:s3:::${SourceBucket}
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub arn:${AWS::Partition}:s3:::${SourceBucket}
+                Condition:
+                  StringLike:
+                    s3:prefix: [!Ref SourcePrefix, !Sub '${SourcePrefix}/*']
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::${SourceBucket}/${SourcePrefix}/*
+              - Effect: Allow
+                Action: [s3:GetBucketLocation, s3:ListBucket, s3:ListBucketMultipartUploads]
+                Resource: !GetAtt Bucket.Arn
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject, s3:AbortMultipartUpload, s3:ListMultipartUploadParts]
+                Resource: !Sub '${Bucket.Arn}/*'
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref Role]
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
+  Instance:
+    Type: AWS::EC2::Instance
+    DependsOn: [Route, RouteAssociation]
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT30M
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          AssociatePublicIpAddress: true
+          SubnetId: !Ref Subnet
+          GroupSet: [!Ref SecurityGroup]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: !Ref VolumeSize
+            Encrypted: true
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-benchmark'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          dnf install -y git aws-cfn-bootstrap
+          trap '/opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource Instance --region ${AWS::Region}' EXIT
+          curl --proto '=https' --tlsv1.2 -LsSf https://astral.sh/uv/${UvVersion}/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+          git clone https://github.com/pyathena-dev/PyAthena.git /opt/pyathena
+          git -C /opt/pyathena fetch origin ${GitCommit}
+          git -C /opt/pyathena checkout --detach ${GitCommit}
+          export UV_PYTHON_INSTALL_DIR=/opt/uv-python
+          uv python install ${PythonVersion}
+          uv sync --directory /opt/pyathena/benchmarks --locked --no-dev --python ${PythonVersion}
+          chmod -R a+rX /opt/uv-python
+          chown -R ec2-user:ec2-user /opt/pyathena
+          printf '%s\n' '${AWS::StackId}' > /opt/pyathena/benchmarks/stack-id.txt
+          printf '%s\n' 'Setup complete. Run preflight and prepare manually.'
+
+Outputs:
+  Bucket:
+    Value: !Ref Bucket
+  ScratchDatabase:
+    Value: !Ref ScratchDatabase
+  InstanceId:
+    Value: !Ref Instance
+  SourceBucket:
+    Value: !Ref SourceBucket
+  SourcePrefix:
+    Value: !Ref SourcePrefix
+  SourceDatabase:
+    Value: !Ref SourceDatabase
+  SourceTable:
+    Value: !Ref SourceTable
+  WorkGroup:
+    Value: !Ref WorkGroup
