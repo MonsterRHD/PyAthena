@@ -656,11 +656,9 @@ class AthenaPandasResultSet(AthenaResultSet):
             )
         return column_names, selected_names
 
-    def _configure_binary_csv_read(
-        self, read_csv_kwargs: dict[str, Any], read_csv: Callable[..., DataFrame]
-    ) -> set[int]:
-        """Wrap binary converters and return column positions needing NULL preservation."""
-        if (
+    def _can_preserve_binary_csv_nulls(self, read_csv_kwargs: dict[str, Any]) -> bool:
+        """Whether CSV settings support distinguishing binary NULL from empty values."""
+        return not (
             "varbinary" not in self._converter.mappings
             or "converters" in self._kwargs
             or not self.output_location
@@ -670,7 +668,32 @@ class AthenaPandasResultSet(AthenaResultSet):
             or read_csv_kwargs.get("dialect") is not None
             or read_csv_kwargs.get("quoting") == csv.QUOTE_NONE
             or read_csv_kwargs.get("quotechar", '"') != '"'
-        ):
+        )
+
+    def _needs_csv_column_name_resolution(self, column_names: list[Any]) -> bool:
+        """Whether pandas must resolve column names instead of using Athena metadata."""
+        return (
+            len(set(column_names)) != len(column_names)
+            or not all(column_names)
+            or bool(
+                self._kwargs.keys()
+                & {
+                    "names",
+                    "usecols",
+                    "sep",
+                    "delimiter",
+                    "doublequote",
+                    "escapechar",
+                    "skipinitialspace",
+                }
+            )
+        )
+
+    def _configure_binary_csv_read(
+        self, read_csv_kwargs: dict[str, Any], read_csv: Callable[..., DataFrame]
+    ) -> set[int]:
+        """Wrap binary converters and return column positions needing NULL preservation."""
+        if not self._can_preserve_binary_csv_nulls(read_csv_kwargs):
             return set()
 
         description = self.description or []
@@ -680,20 +703,7 @@ class AthenaPandasResultSet(AthenaResultSet):
 
         column_names = [d[0] for d in description]
         converters = read_csv_kwargs["converters"]
-        if (
-            len(set(column_names)) != len(column_names)
-            or not all(column_names)
-            or self._kwargs.keys()
-            & {
-                "names",
-                "usecols",
-                "sep",
-                "delimiter",
-                "doublequote",
-                "escapechar",
-                "skipinitialspace",
-            }
-        ):
+        if self._needs_csv_column_name_resolution(column_names):
             column_names, selected_names = self._resolve_csv_column_names(
                 column_names, read_csv_kwargs, read_csv
             )
