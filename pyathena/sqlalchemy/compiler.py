@@ -34,6 +34,7 @@ from pyathena.sqlalchemy.types import (
     AthenaStruct,
     _array_item_type,
     _decorator_impl,
+    _has_unknown_array_element,
     get_double_type,
 )
 from pyathena.sqlalchemy.util import _split_type_arguments
@@ -261,7 +262,10 @@ class AthenaStatementCompiler(SQLCompiler):
             not self.stack
             and not kw.get("asfrom")
             and (select_stmt._distinct or select_stmt._order_by_clauses)
-            and any(isinstance(column.type, types.ARRAY) for column in select_stmt.selected_columns)
+            and any(
+                isinstance(column.type, types.ARRAY) and not _has_unknown_array_element(column.type)
+                for column in select_stmt.selected_columns
+            )
         ):
             return self._array_result_select(select_stmt)
         return select_stmt
@@ -270,7 +274,10 @@ class AthenaStatementCompiler(SQLCompiler):
         if (
             not self.stack
             and not asfrom
-            and any(isinstance(column.type, types.ARRAY) for column in cs.selected_columns)
+            and any(
+                isinstance(column.type, types.ARRAY) and not _has_unknown_array_element(column.type)
+                for column in cs.selected_columns
+            )
         ):
             original_columns = list(cs.selected_columns)
             rendered = self.process(self._array_result_select(cs), **kw)
@@ -294,13 +301,18 @@ class AthenaStatementCompiler(SQLCompiler):
                 return element.element
             return None
 
-        clauses = [
-            TextClause(part) if isinstance(clause, TextClause) else clause
-            for clause in statement._order_by_clauses
-            for part in (
-                _split_type_arguments(clause.text) if isinstance(clause, TextClause) else [""]
-            )
-        ]
+        clauses: list[Any] = []
+        for clause in statement._order_by_clauses:
+            if isinstance(clause, TextClause):
+                try:
+                    clauses.extend(TextClause(part) for part in _split_type_arguments(clause.text))
+                except ValueError as error:
+                    raise exc.CompileError(
+                        "Textual ARRAY ordering must name selected columns; "
+                        "use SQLAlchemy column expressions for other ordering"
+                    ) from error
+            else:
+                clauses.append(clause)
         for clause in clauses:
             if isinstance(clause, TextClause):
                 match = re.fullmatch(
@@ -310,11 +322,15 @@ class AthenaStatementCompiler(SQLCompiler):
                 )
                 if match:
                     name, direction, nulls = match.groups()
-                    name = name[1:-1].replace('""', '"') if name.startswith('"') else name
-                    if name.isdigit() and 1 <= int(name) <= len(columns):
-                        name = columns[int(name) - 1].key
-                    if name in statement.selected_columns:
-                        clause = statement.selected_columns[name]
+                    quoted = name.startswith('"')
+                    name = name[1:-1].replace('""', '"') if quoted else name
+                    target = None
+                    if not quoted and name.isdigit() and 1 <= int(name) <= len(columns):
+                        target = columns[int(name) - 1]
+                    elif name in statement.selected_columns:
+                        target = statement.selected_columns[name]
+                    if target is not None:
+                        clause = target
                         if direction:
                             clause = clause.desc() if direction.upper() == "DESC" else clause.asc()
                         if nulls:

@@ -1,10 +1,24 @@
 import json
+import pickle
 from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
+from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import Column, Integer, MetaData, String, Table, cast, literal, select, text, types
+from sqlalchemy import (
+    LABEL_STYLE_TABLENAME_PLUS_COL,
+    Column,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    cast,
+    literal,
+    select,
+    text,
+    types,
+)
 from sqlalchemy import exc as sa_exc
 from sqlalchemy.sql import sqltypes
 
@@ -506,3 +520,50 @@ def test_textual_ordering_list_and_unresolved_expression():
     assert "ORDER BY anon_1.items DESC, anon_1.id" in sql
     with pytest.raises(sa_exc.CompileError, match="column expressions"):
         select(table).order_by(text("cardinality(items)")).compile(dialect=AthenaDialect())
+
+
+def test_array_ordering_ordinals_use_selected_positions():
+    first = Table(
+        "first_table", MetaData(), Column("id", Integer), Column("items", AthenaArray(Integer))
+    )
+    second = Table("second_table", MetaData(), Column("id", Integer))
+    sql = str(
+        select(first.c.id, second.c.id, first.c["items"])
+        .order_by(text("2"))
+        .compile(dialect=AthenaDialect())
+    )
+    assert "ORDER BY anon_1.id_1" in sql
+    sql = str(
+        select(first)
+        .set_label_style(LABEL_STYLE_TABLENAME_PLUS_COL)
+        .order_by(text("1"))
+        .compile(dialect=AthenaDialect())
+    )
+    assert "ORDER BY anon_1.first_table_id" in sql
+    numeric = Table("numeric", MetaData(), Column("id", Integer), Column("1", AthenaArray(Integer)))
+    sql = str(select(numeric).order_by(text('"1"')).compile(dialect=AthenaDialect()))
+    assert 'ORDER BY anon_1."1"' in sql
+
+
+@pytest.mark.parametrize(
+    "ordering", ["id > 5", "coalesce(name, ')')", "CASE WHEN id > 5 THEN 0 ELSE 1 END"]
+)
+def test_unsupported_array_text_ordering_raises_compile_error(ordering):
+    table = Table("arrays", MetaData(), Column("items", AthenaArray(Integer)))
+    with pytest.raises(sa_exc.CompileError, match="column expressions"):
+        select(table).order_by(text(ordering)).compile(dialect=AthenaDialect())
+
+
+def test_unknown_array_does_not_rewrite_ordering():
+    table = Table("arrays", MetaData(), Column("items", AthenaArray(types.NullType())))
+    sql = str(select(table).order_by(text("lower(name)")).compile(dialect=AthenaDialect()))
+    assert "ORDER BY lower(name)" in sql
+    assert "anon_1" not in sql
+
+
+def test_array_pickle_type_uses_overridden_processors():
+    dialect = AthenaDialect(dbapi=SimpleNamespace(Binary=bytes, paramstyle="pyformat"))
+    array = AthenaArray(types.PickleType())
+    bound = array.bind_processor(dialect)([5])
+    assert pickle.loads(bound.values[0]) == 5
+    assert array.result_processor(dialect, None)(json.dumps([bound.values[0].hex()])) == [5]
