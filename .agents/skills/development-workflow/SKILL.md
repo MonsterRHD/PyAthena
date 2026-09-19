@@ -77,7 +77,8 @@ Record each round separately: perspective, full base/head SHAs, covered surfaces
 Publish review records as inline comments on relevant diff lines through `gh api repos/OWNER/REPO/pulls/NUMBER/reviews`, using a `comments` array and an empty review body.
 Use `event: COMMENT`, not approval of your own PR, and store the JSON request in a temporary file passed with `--input`.
 For a clean round, anchor its evidence to a relevant changed line.
-Record a repair in its existing thread using `POST repos/OWNER/REPO/pulls/NUMBER/comments/COMMENT_ID/replies` with a `body` field; replies do not use the review request's `comments` array.
+Record a repair in its existing thread using `POST repos/OWNER/REPO/pulls/NUMBER/comments/COMMENT_ID/replies` with a `body` field; `COMMENT_ID` must identify the thread's top-level comment, which has no `in_reply_to_id`.
+Replies do not use the review request's `comments` array, and GitHub does not support replying to another reply.
 For a finding outside the diff, anchor to the related changed line and name the actual `file:line` in the comment; GitHub rejects line anchors outside the diff.
 If the user's review-only scope prohibits posting, keep the result in the response instead.
 

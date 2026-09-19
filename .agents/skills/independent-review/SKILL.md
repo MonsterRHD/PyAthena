@@ -20,7 +20,7 @@ Existing authorization applies within its scope; this skill does not authorize u
 
 ## Provide a bounded review package
 
-Freeze the published base/head pair and a clean source snapshot before launching.
+Freeze the review merge-base SHA and published head SHA, as defined in the workflow skill, and a clean source snapshot before launching.
 Use a detached worktree or an exported snapshot of tracked files that matches the reviewed commit.
 Exclude credentials, `.env`, local memory, and unrelated artifacts from an external review package.
 Supply the literal diff and relevant source/tests plus repository conventions.
