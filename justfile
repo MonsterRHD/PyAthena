@@ -70,6 +70,23 @@ _docs-lint:
 _docs-format:
     mise exec -- markdownlint-cli2 --fix
 
+# Standalone benchmark checks; these do not execute Athena queries
+benchmark target="lint":
+    @just _benchmark-{{ target }}
+
+_benchmark-format:
+    uvx ruff@{{RUFF_VERSION}} check --config benchmarks/pyproject.toml --select I --fix benchmarks
+    uvx ruff@{{RUFF_VERSION}} format --config benchmarks/pyproject.toml benchmarks
+
+_benchmark-lint:
+    uvx ruff@{{RUFF_VERSION}} check --config benchmarks/pyproject.toml benchmarks
+    uvx ruff@{{RUFF_VERSION}} format --check --config benchmarks/pyproject.toml benchmarks
+    uv run --directory benchmarks --locked mypy
+    uv run --directory benchmarks --locked cfn-lint cloudformation/benchmark.yaml
+
+_benchmark-test: _benchmark-lint
+    uv run --directory benchmarks --locked pytest
+
 # Install development tools
 tool:
     uv tool install ruff@{{RUFF_VERSION}}

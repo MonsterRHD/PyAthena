@@ -21,6 +21,7 @@
   },
   "globs": [
     "docs/**/*.md",
+    "benchmarks/README.md",
     "*.md"
   ],
   "ignores": [

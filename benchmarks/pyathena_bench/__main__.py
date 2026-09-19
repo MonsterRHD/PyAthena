@@ -1,0 +1,136 @@
+"""Command line entry point for explicit preparation and measurement."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+from dataclasses import asdict, replace
+from pathlib import Path
+
+from pyathena_bench.aws import cleanup, preflight, prepare, prepare_fixtures, validate_manifest
+from pyathena_bench.cases import FAMILIES, matrix
+from pyathena_bench.config import Settings, read_json
+from pyathena_bench.report import report
+from pyathena_bench.runner import run
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(
+        description="Athena cursor benchmarks (AWS operations are explicit)"
+    )
+    root.add_argument("--config", type=Path, default=Path("config.toml"))
+    root.add_argument("--profile", help="Local AWS profile; omit on EC2")
+    commands = root.add_subparsers(dest="command", required=True)
+    check = commands.add_parser(
+        "preflight", help="Read stack and input metadata without querying Athena"
+    )
+    check.add_argument("--stack", required=True)
+    prep = commands.add_parser("prepare", help="Create fixed inputs; incurs Athena and S3 usage")
+    prep.add_argument("--stack", required=True)
+    prep.add_argument("--manifest", type=Path, required=True)
+    prep.add_argument("--scale", nargs="+", required=True)
+    for name in ("plan", "run"):
+        command = commands.add_parser(name)
+        command.add_argument("--suite", choices=("single", "concurrent", "init"), required=True)
+        command.add_argument("--scale", nargs="+", required=True)
+        command.add_argument("--shape", choices=("flat", "nested"), default="flat")
+        command.add_argument("--family", choices=(*FAMILIES, "wrangler"), nargs="+")
+        command.add_argument(
+            "--api", choices=("sync", "thread", "aio", "direct", "to_thread"), nargs="+"
+        )
+        command.add_argument("--transport", choices=("csv", "unload", "ctas"), nargs="+")
+        command.add_argument("--output-kind", choices=("rows", "native"))
+        if name == "run":
+            command.add_argument("--manifest", type=Path, required=True)
+            command.add_argument("--out", type=Path, required=True)
+    summary = commands.add_parser(
+        "report", help="Generate CSV and Markdown from local measurements"
+    )
+    summary.add_argument("directory", type=Path)
+    clean = commands.add_parser(
+        "cleanup", help="Preview or delete one manifest's temporary resources"
+    )
+    clean.add_argument("--manifest", type=Path, required=True)
+    clean.add_argument("--execute", action="store_true")
+    return root
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    if args.command == "report":
+        report(args.directory)
+        return 0
+    settings = Settings.load(args.config)
+    if args.profile:
+        settings = replace(settings, profile=args.profile)
+    scales = getattr(args, "scale", [])
+    if len(set(scales)) != len(scales) or any(s not in settings.scales for s in scales):
+        raise ValueError("Select distinct scales defined in the configuration")
+    if args.command == "preflight":
+        sys.stdout.write(json.dumps(preflight(settings, args.stack), indent=2) + "\n")
+    elif args.command == "prepare":
+        prepare(settings, args.stack, args.manifest, scales)
+    elif args.command == "cleanup":
+        manifest = read_json(args.manifest)
+        resources = validate_manifest(settings, manifest)
+        sys.stdout.write(
+            json.dumps(
+                {
+                    "stack": resources["StackId"],
+                    "database": resources["ScratchDatabase"],
+                    "table_prefix": f"b_{manifest['run_id']}_",
+                    "s3_prefix": f"s3://{resources['Bucket']}/runs/{manifest['run_id']}/",
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        if args.execute:
+            cleanup(settings, manifest, args.manifest)
+    else:
+        cases = matrix(settings, args.suite, args.shape)
+        cases = [
+            c
+            for c in cases
+            if (not args.family or c.family in args.family)
+            and (not args.api or c.api in args.api)
+            and (not args.transport or c.transport in args.transport)
+            and (not args.output_kind or c.output == args.output_kind)
+        ]
+        if not cases:
+            raise ValueError("No cases match the selected filters")
+        if args.command == "plan":
+            sys.stdout.write(
+                json.dumps(
+                    {
+                        "scales": {s: settings.scales[s] for s in scales},
+                        "trials": sum(c.unsupported is None for c in cases)
+                        * len(scales)
+                        * (settings.warmups + settings.repetitions),
+                        "cases": [{"id": c.id, **asdict(c)} for c in cases],
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+        else:
+            if args.out.exists():
+                raise ValueError("Output directory already exists")
+            manifest = read_json(args.manifest)
+            if args.suite == "init":
+                prepare_fixtures(settings, manifest, args.manifest, scales, args.shape)
+            success = run(settings, manifest, cases, scales, args.out)
+            report(args.out)
+            return 0 if success else 1
+    return 0
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.WARNING)
+    try:
+        sys.exit(main())
+    except (ValueError, RuntimeError, OSError) as exc:
+        logging.error("%s", exc)
+        sys.exit(1)
