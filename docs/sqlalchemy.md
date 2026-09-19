@@ -1003,7 +1003,49 @@ value = map_data['key1']  # Direct access
 
 ### ARRAY type support
 
-PyAthena provides comprehensive support for Amazon Athena's ARRAY data types, enabling you to work with ordered collections of data in your Python applications.
+PyAthena supports SQLAlchemy's `ARRAY` type and the dialect-specific `AthenaArray` type.
+Both store native Athena arrays and return typed Python collections.
+Reflected ARRAY columns use `AthenaArray` and preserve their element types, including nested arrays, maps, rows, decimal precision, and string length where Athena retains it.
+
+```python
+from sqlalchemy import ARRAY, Column, Integer, MetaData, String, Table, select
+
+metadata = MetaData()
+events = Table(
+    "events",
+    metadata,
+    Column("id", Integer),
+    Column("numbers", ARRAY(Integer)),
+    Column("labels", ARRAY(String, dimensions=2)),
+)
+
+connection.execute(
+    events.insert(),
+    {"id": 1, "numbers": [1, None, 3], "labels": [["one", "two"], ["a,b", "001"]]},
+)
+row = connection.execute(select(events.c.numbers, events.c.labels)).one()
+assert row.numbers == [1, None, 3]
+assert row.labels == [["one", "two"], ["a,b", "001"]]
+```
+
+Use `dimensions=N` for a fixed number of dimensions with the standard SQLAlchemy type.
+Without it, the table column has one dimension.
+The existing `AthenaArray(AthenaArray(Integer))` spelling also remains supported; do not combine nested ARRAY types with `dimensions`.
+`AthenaArray()` still defaults to string elements, and the uppercase `pyathena.sqlalchemy.types.ARRAY` alias remains available.
+Set `as_tuple=True` to return tuples at each array dimension instead of lists.
+
+Bound parameters, multiple parameter sets, and SQLAlchemy literals use Athena's `ARRAY[...]` constructors.
+An empty list represents an empty array, `None` represents SQL NULL, and individual elements can also be NULL.
+Ordinary DB API list and tuple parameters retain their existing `IN (...)` formatting.
+
+Typed SQLAlchemy SELECT expressions use a JSON transport projection to preserve nested values and strings containing commas, quotes, whitespace, or the word `null`.
+Scalar leaves are decoded according to the declared type, preserving decimal precision, dates, timestamps, and binary values.
+SQL predicates and intermediate subqueries still operate on native arrays.
+Raw `text()` queries and direct DB API queries retain the cursor's existing conversion behavior described below; they do not receive this projection automatically.
+
+Compared with earlier releases, reflected ARRAY columns are no longer reported as `String`.
+ARRAY DDL now renders integer elements as `INT` and row elements as `STRUCT<...>`, which Athena requires for nested DDL types.
+Code that inspects reflected types or compares compiled SQL strings should account for these changes.
 
 #### Basic Usage
 
@@ -1025,7 +1067,7 @@ This creates a table definition equivalent to:
 ```sql
 CREATE TABLE orders (
     id INTEGER,
-    item_ids ARRAY<INTEGER>,
+    item_ids ARRAY<INT>,
     tags ARRAY<STRING>,
     categories ARRAY<STRING>
 )
@@ -1036,13 +1078,11 @@ CREATE TABLE orders (
 PyAthena automatically converts ARRAY data between different formats:
 
 ```python
-from sqlalchemy import create_engine, select
+from sqlalchemy import text
 
 # Query ARRAY data using ARRAY constructor
 result = connection.execute(
-    select().from_statement(
-        text("SELECT ARRAY[1, 2, 3, 4, 5] as item_ids")
-    )
+    text("SELECT ARRAY[1, 2, 3, 4, 5] as item_ids")
 ).fetchone()
 
 # Access ARRAY data as Python list
@@ -1056,18 +1096,14 @@ For arrays containing complex data types:
 ```python
 # Arrays with STRUCT elements
 result = connection.execute(
-    select().from_statement(
-        text("SELECT ARRAY[ROW('Alice', 25), ROW('Bob', 30)] as users")
-    )
+    text("SELECT ARRAY[ROW('Alice', 25), ROW('Bob', 30)] as users")
 ).fetchone()
 
 users = result.users  # [{"0": "Alice", "1": 25}, {"0": "Bob", "1": 30}]
 
 # Using CAST AS JSON for complex ARRAY operations
 result = connection.execute(
-    select().from_statement(
-        text("SELECT CAST(ARRAY[1, 2, 3] AS JSON) as data")
-    )
+    text("SELECT CAST(ARRAY[1, 2, 3] AS JSON) as data")
 ).fetchone()
 
 # Parse JSON result
@@ -1118,14 +1154,14 @@ from pyathena.sqlalchemy.types import AthenaArray, AthenaStruct, AthenaMap
 
 # Simple arrays
 AthenaArray(String)      # ARRAY<STRING>
-AthenaArray(Integer)     # ARRAY<INTEGER>
+AthenaArray(Integer)     # ARRAY<INT>
 
 # Arrays of complex types
 AthenaArray(AthenaStruct(...))  # ARRAY<STRUCT<...>>
 AthenaArray(AthenaMap(...))     # ARRAY<MAP<...>>
 
 # Nested arrays
-AthenaArray(AthenaArray(Integer))  # ARRAY<ARRAY<INTEGER>>
+AthenaArray(AthenaArray(Integer))  # ARRAY<ARRAY<INT>>
 ```
 
 #### Best practices

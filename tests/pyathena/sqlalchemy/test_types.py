@@ -1,9 +1,14 @@
+import json
 from datetime import date, datetime
+from decimal import Decimal
 
 import pytest
-from sqlalchemy import Integer, String, types
+from sqlalchemy import Column, Integer, MetaData, String, Table, cast, literal, select, types
 from sqlalchemy.sql import sqltypes
 
+import pyathena
+from pyathena.formatter import DefaultParameterFormatter
+from pyathena.sqlalchemy.base import AthenaDialect
 from pyathena.sqlalchemy.types import (
     ARRAY,
     MAP,
@@ -167,6 +172,176 @@ def test_get_double_type():
     else:
         assert result is types.FLOAT
     assert ischema_names["double"] is result
+
+
+@pytest.mark.parametrize(
+    ("type_", "ddl", "dml"),
+    [
+        (types.ARRAY(Integer), "ARRAY<INT>", "ARRAY(INTEGER)"),
+        (AthenaArray(), "ARRAY<STRING>", "ARRAY(VARCHAR)"),
+        (ARRAY(String(12)), "ARRAY<STRING>", "ARRAY(VARCHAR(12))"),
+        (types.ARRAY(String, dimensions=2), "ARRAY<ARRAY<STRING>>", "ARRAY(ARRAY(VARCHAR))"),
+        (AthenaArray(AthenaArray(Integer)), "ARRAY<ARRAY<INT>>", "ARRAY(ARRAY(INTEGER))"),
+        (AthenaArray(types.Numeric(12, 3)), "ARRAY<DECIMAL(12, 3)>", "ARRAY(DECIMAL(12, 3))"),
+        (AthenaArray(types.Float), "ARRAY<FLOAT>", "ARRAY(REAL)"),
+        (AthenaArray(types.BINARY), "ARRAY<BINARY>", "ARRAY(VARBINARY)"),
+    ],
+)
+def test_array_type_rendering(type_, ddl, dml):
+    dialect = AthenaDialect()
+    assert type_.compile(dialect=dialect) == ddl
+    assert str(cast(literal(None), type_).compile(dialect=dialect)).endswith(f"AS {dml})")
+    assert isinstance(type_.dialect_impl(dialect), types.ARRAY)
+
+
+@pytest.mark.parametrize(
+    ("signature", "expected"),
+    [
+        ("array<integer>", AthenaArray(types.INTEGER)),
+        ("ARRAY(ARRAY(VARCHAR(32)))", AthenaArray(AthenaArray(types.VARCHAR(32)))),
+        ("array<decimal(18,7)>", AthenaArray(types.DECIMAL(18, 7))),
+        (
+            "array<map<string,array<int>>>",
+            AthenaArray(AthenaMap(String, AthenaArray(types.INTEGER))),
+        ),
+        (
+            'array<struct<"a,b":decimal(10,2),`c:d`:varchar(17)>>',
+            AthenaArray(AthenaStruct(("a,b", types.DECIMAL(10, 2)), ("c:d", types.VARCHAR(17)))),
+        ),
+    ],
+)
+def test_array_reflection_preserves_element_types(signature, expected):
+    actual = AthenaDialect()._get_column_type(signature)
+    assert isinstance(actual, types.ARRAY)
+    assert actual._static_cache_key == expected._static_cache_key
+
+
+@pytest.mark.parametrize("dimensions", [0, -1, True, 1.5])
+def test_array_rejects_invalid_dimensions(dimensions):
+    with pytest.raises(ValueError, match="positive integer"):
+        AthenaArray(Integer, dimensions=dimensions)
+
+
+def test_array_rejects_ambiguous_dimensions():
+    with pytest.raises(ValueError, match="either nested ARRAY types or dimensions"):
+        AthenaArray(AthenaArray(Integer), dimensions=2)
+
+
+@pytest.mark.parametrize(
+    ("type_", "value", "expected"),
+    [
+        (AthenaArray(Integer), [1, None, 3], "ARRAY[1, NULL, 3]"),
+        (
+            AthenaArray(String),
+            ["thr'ee", "réve🐍 illé", "a,b", "null"],
+            "ARRAY['thr''ee', 'réve🐍 illé', 'a,b', 'null']",
+        ),
+        (
+            AthenaArray(String, dimensions=2),
+            [["one"], [], None],
+            "ARRAY[ARRAY['one'], ARRAY[], NULL]",
+        ),
+        (AthenaArray(types.Date), [date(2025, 1, 2)], "ARRAY[DATE '2025-01-02']"),
+        (AthenaArray(types.BINARY), [b"\x00\xff"], "ARRAY[X'00ff']"),
+        (AthenaArray(Integer), [], "ARRAY[]"),
+        (AthenaArray(Integer), None, "NULL"),
+    ],
+)
+def test_array_bound_and_literal_values(type_, value, expected):
+    dialect = AthenaDialect()
+    assert type_.literal_processor(dialect)(value) == expected
+    bound = type_.bind_processor(dialect)(value)
+    actual = DefaultParameterFormatter().format("SELECT %(value)s", {"value": bound})
+    assert actual == "SELECT " + expected.replace("NULL", "null")
+
+
+def test_array_binding_preserves_in_parameters():
+    formatter = DefaultParameterFormatter()
+    assert (
+        formatter.format("SELECT 1 WHERE 1 IN %(items)s", {"items": [1, 2]})
+        == "SELECT 1 WHERE 1 IN (1, 2)"
+    )
+
+
+def test_array_binary_binding_uses_native_literals():
+    dialect = AthenaDialect(dbapi=pyathena)
+    processor = AthenaArray(types.BINARY).bind_processor(dialect)
+    assert (
+        DefaultParameterFormatter().format("SELECT %(value)s", {"value": processor([b"\xff"])})
+        == "SELECT ARRAY[X'ff']"
+    )
+
+
+@pytest.mark.parametrize("value", [[[1]], "[1]", {"x": 1}])
+def test_array_binding_rejects_incorrect_shape(value):
+    with pytest.raises(TypeError, match="ARRAY"):
+        AthenaArray(Integer).bind_processor(AthenaDialect())(value)
+
+
+def test_array_textual_sql_preserves_native_fallback():
+    value = "[[one, two], [a,b]]"
+    assert AthenaArray(String, dimensions=2).result_processor(AthenaDialect(), None)(value) == value
+
+
+def test_array_insert_uses_typed_parameter():
+    formatter = DefaultParameterFormatter()
+    table = Table("array_values", MetaData(), Column("items", types.ARRAY(Integer)))
+    compiled = table.insert().values(items=[1, 2]).compile(dialect=AthenaDialect())
+    params = {
+        name: compiled._bind_processors[name](value) for name, value in compiled.params.items()
+    }
+    assert (
+        formatter.format(str(compiled), params)
+        == "INSERT INTO array_values (items) VALUES (CAST(ARRAY[1, 2] AS ARRAY(INTEGER)))"
+    )
+
+
+@pytest.mark.parametrize(
+    ("type_", "encoded", "expected"),
+    [
+        (AthenaArray(Integer), '["1",null,"3"]', [1, None, 3]),
+        (AthenaArray(String), '["001","null","a,b",""]', ["001", "null", "a,b", ""]),
+        (AthenaArray(Integer, dimensions=2, as_tuple=True), '[["1"],[],null]', ((1,), (), None)),
+        (
+            AthenaArray(types.Numeric(30, 20)),
+            '["0.12345678901234567890"]',
+            [Decimal("0.12345678901234567890")],
+        ),
+        (AthenaArray(types.Date), '["2025-01-02"]', [date(2025, 1, 2)]),
+        (AthenaArray(types.BINARY), '["00FF",""]', [b"\x00\xff", b""]),
+        (
+            AthenaArray(AthenaMap(Integer, String)),
+            '[[["1","001"],["2",null]]]',
+            [{1: "001", 2: None}],
+        ),
+        (
+            AthenaArray(AthenaStruct(("name", String), ("n", Integer))),
+            '[{"name":"001","n":"2"},null]',
+            [{"name": "001", "n": 2}, None],
+        ),
+    ],
+)
+def test_array_result_conversion(type_, encoded, expected):
+    processor = type_.result_processor(AthenaDialect(), None)
+    assert processor(encoded) == expected
+    assert processor(json.loads(encoded)) == expected
+    assert processor(None) is None
+
+
+def test_array_result_projection_does_not_change_subquery_type():
+    table = Table("array_values", MetaData(), Column("items", AthenaArray(Integer)))
+    subquery = select(table.c["items"]).subquery()
+    compiled = str(select(subquery.c["items"]).compile(dialect=AthenaDialect()))
+    assert compiled.count("json_format(") == 1
+    assert "SELECT array_values.items AS items" in compiled
+    assert isinstance(subquery.c["items"].type, types.ARRAY)
+
+
+def test_array_cache_key_includes_nested_fields():
+    first = AthenaArray(AthenaStruct(("x", Integer)))
+    second = AthenaArray(AthenaStruct(("x", String)))
+    assert first._static_cache_key != second._static_cache_key
+    assert hash(first._static_cache_key)
 
 
 class TestAthenaDate:

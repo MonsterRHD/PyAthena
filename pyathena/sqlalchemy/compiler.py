@@ -19,7 +19,12 @@ from pyathena.model import (
     AthenaRowFormatSerde,
 )
 from pyathena.sqlalchemy.preparer import AthenaDDLIdentifierPreparer
-from pyathena.sqlalchemy.types import AthenaArray, AthenaMap, AthenaStruct, get_double_type
+from pyathena.sqlalchemy.types import (
+    AthenaMap,
+    AthenaStruct,
+    _array_item_type,
+    get_double_type,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy import (
@@ -93,7 +98,7 @@ class AthenaTypeCompiler(GenericTypeCompiler):
         return "TINYINT"
 
     def visit_INTEGER(self, type_: types.Integer, **kw: Any) -> str:
-        return "INTEGER"
+        return "INT" if kw.get("_athena_array_ddl") else "INTEGER"
 
     def visit_SMALLINT(self, type_: types.SmallInteger, **kw: Any) -> str:
         return "SMALLINT"
@@ -177,7 +182,16 @@ class AthenaTypeCompiler(GenericTypeCompiler):
                 field_specs = []
                 for field_name, field_type in type_.fields.items():
                     field_type_str = self.process(field_type, **kw)
-                    field_specs.append(f"{field_name} {field_type_str}")
+                    preparer = (
+                        AthenaDDLIdentifierPreparer(self.dialect)
+                        if kw.get("_athena_array_ddl")
+                        else self.dialect.identifier_preparer
+                    )
+                    name = preparer.quote(field_name)
+                    separator = ":" if kw.get("_athena_array_ddl") else " "
+                    field_specs.append(f"{name}{separator}{field_type_str}")
+                if kw.get("_athena_array_ddl"):
+                    return f"STRUCT<{', '.join(field_specs)}>"
                 return f"ROW({', '.join(field_specs)})"
             return "ROW()"
         return "ROW()"
@@ -196,8 +210,9 @@ class AthenaTypeCompiler(GenericTypeCompiler):
         return self.visit_map(type_, **kw)
 
     def visit_array(self, type_, **kw):
-        if isinstance(type_, AthenaArray):
-            item_type_str = self.process(type_.item_type, **kw)
+        if isinstance(type_, types.ARRAY):
+            kw["_athena_array_ddl"] = True
+            item_type_str = self.process(_array_item_type(type_), **kw)
             return f"ARRAY<{item_type_str}>"
         return "ARRAY<STRING>"
 
@@ -288,6 +303,11 @@ class AthenaStatementCompiler(SQLCompiler):
         return super().visit_truediv_binary(binary, operator, **kw)
 
     def visit_cast(self, cast: Cast[Any], **kwargs):
+        if isinstance(cast.type, (types.ARRAY, AthenaMap, AthenaStruct)):
+            return (
+                f"CAST({self.process(cast.clause, **kwargs)} "
+                f"AS {self._complex_dml_type(cast.type)})"
+            )
         if (isinstance(cast.type, types.VARCHAR) and cast.type.length is None) or isinstance(
             cast.type, types.String
         ):
@@ -306,6 +326,64 @@ class AthenaStatementCompiler(SQLCompiler):
         else:
             type_clause = cast.typeclause._compiler_dispatch(self, **kwargs)
         return f"CAST({cast.clause._compiler_dispatch(self, **kwargs)} AS {type_clause})"
+
+    def _complex_dml_type(self, type_):
+        if isinstance(type_, types.ARRAY):
+            return f"ARRAY({self._complex_dml_type(_array_item_type(type_))})"
+        if isinstance(type_, AthenaMap):
+            return (
+                f"MAP({self._complex_dml_type(type_.key_type)}, "
+                f"{self._complex_dml_type(type_.value_type)})"
+            )
+        if isinstance(type_, AthenaStruct):
+            fields = ", ".join(
+                f"{self.preparer.quote(name)} {self._complex_dml_type(field_type)}"
+                for name, field_type in type_.fields.items()
+            )
+            return f"ROW({fields})"
+        if isinstance(type_, types.String):
+            return f"VARCHAR({type_.length})" if type_.length else "VARCHAR"
+        if isinstance(type_, (types.LargeBinary, types.BINARY, types.VARBINARY)):
+            return "VARBINARY"
+        if isinstance(type_, get_double_type()) and not isinstance(type_, types.REAL):
+            return "DOUBLE"
+        if isinstance(type_, types.Float):
+            return "REAL"
+        return self.dialect.type_compiler_instance.process(type_)
+
+    def visit_athena_array_result(self, expression, **kw):
+        value = self.process(expression.element, **kw)
+        return f"json_format({self._array_json(value, expression.type)})"
+
+    def _array_json(self, value, type_, depth=0):
+        # Each recursive value becomes JSON, including map keys and typed scalar leaves.
+        variable = f"_pyathena_array_{depth}"
+        if isinstance(type_, types.ARRAY):
+            child = self._array_json(variable, _array_item_type(type_), depth + 1)
+            return f"CAST(transform({value}, {variable} -> {child}) AS JSON)"
+        if isinstance(type_, AthenaMap):
+            key = self._array_json(f"{variable}[1]", type_.key_type, depth + 1)
+            item = self._array_json(f"{variable}[2]", type_.value_type, depth + 1)
+            return (
+                f"CAST(transform(map_entries({value}), {variable} -> ARRAY[{key}, {item}]) AS JSON)"
+            )
+        if isinstance(type_, AthenaStruct) and type_.fields:
+            names = ", ".join(
+                self.render_literal_value(name, types.String()) for name in type_.fields
+            )
+            fields = ", ".join(
+                self._array_json(f"({value}).{self.preparer.quote(name)}", field_type, depth + 1)
+                for name, field_type in type_.fields.items()
+            )
+            return (
+                f"IF({value} IS NULL, CAST(NULL AS JSON), "
+                f"CAST(MAP(ARRAY[{names}], ARRAY[{fields}]) AS JSON))"
+            )
+        if isinstance(type_, (types.JSON, AthenaStruct)):
+            return f"CAST({value} AS JSON)"
+        if isinstance(type_, (types.LargeBinary, types.BINARY, types.VARBINARY)):
+            return f"CAST(to_hex({value}) AS JSON)"
+        return f"CAST(CAST({value} AS VARCHAR) AS JSON)"
 
     def limit_clause(self, select: GenerativeSelect, **kw):
         text = []
