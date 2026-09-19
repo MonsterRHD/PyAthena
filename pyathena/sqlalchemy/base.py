@@ -251,10 +251,31 @@ class AthenaDialect(DefaultDialect):
         self._connect_options = opts
         return opts
 
+    @staticmethod
+    def _metadata_identity(
+        raw_connection: PoolProxiedConnection, table_name: str | None, schema: str | None
+    ) -> tuple[str | None, str | None, str | None]:
+        """Resolve the catalog, schema and table name a metadata request uses.
+
+        Cursor keyword arguments override the connection catalog. Glue lowercases
+        table names, so ``AwsDataCatalog`` lookups fold case; other catalogs keep
+        the name as given.
+        """
+        catalog = raw_connection.cursor_kwargs.get("catalog_name", raw_connection.catalog_name)
+        schema = schema if schema else raw_connection.schema_name
+        name = None
+        if table_name is not None:
+            name = (
+                str(table_name).lower()
+                if (catalog or "").lower() == "awsdatacatalog"
+                else str(table_name)
+            )
+        return catalog, schema, name
+
     @reflection.cache
     def _get_schemas(self, connection, **kw):
         raw_connection = self._raw_connection(connection)
-        catalog = raw_connection.catalog_name  # type: ignore[union-attr]
+        catalog, _, _ = self._metadata_identity(raw_connection, None, None)
         with raw_connection.driver_connection.cursor() as cursor:  # type: ignore[union-attr]
             try:
                 return cursor.list_databases(catalog)
@@ -269,13 +290,7 @@ class AthenaDialect(DefaultDialect):
 
     def _get_table(self, connection, table_name: str, schema: str | None = None, **kw):
         raw_connection = self._raw_connection(connection)
-        schema = schema if schema else raw_connection.schema_name  # type: ignore[union-attr]
-        catalog = raw_connection.cursor_kwargs.get("catalog_name", raw_connection.catalog_name)
-        name = (
-            str(table_name).lower()
-            if (catalog or "").lower() == "awsdatacatalog"
-            else str(table_name)
-        )
+        catalog, schema, name = self._metadata_identity(raw_connection, table_name, schema)
         # Key by the metadata request, not the reflection method's arguments.
         # Listings and individual lookups share positive results in this Inspector.
         info_cache = kw.get("info_cache")
@@ -289,8 +304,7 @@ class AthenaDialect(DefaultDialect):
                 # GetTableMetadata limits table names to 128 characters, while
                 # Athena SQL and ListTableMetadata support longer table names.
                 if len(table_name) > 128:
-                    name = str(table_name).lower()
-                    expression = re.escape(name)
+                    expression = re.escape(str(name))
                     # ListTableMetadata limits its regex filter to 256 characters.
                     # Unusual catalog names can exceed that after regex escaping.
                     for metadata in cursor.list_table_metadata(
@@ -320,8 +334,7 @@ class AthenaDialect(DefaultDialect):
 
     def _get_tables(self, connection, schema: str | None = None, **kw):
         raw_connection = self._raw_connection(connection)
-        schema = schema if schema else raw_connection.schema_name  # type: ignore[union-attr]
-        catalog = raw_connection.cursor_kwargs.get("catalog_name", raw_connection.catalog_name)
+        catalog, schema, _ = self._metadata_identity(raw_connection, None, schema)
         info_cache = kw.get("info_cache")
         cache_key = ("pyathena_table_metadata_list", catalog, schema)
         if info_cache is not None and cache_key in info_cache:
@@ -390,9 +403,12 @@ class AthenaDialect(DefaultDialect):
         except pyathena.error.OperationalError as e:
             cause = e.__cause__
             raw_connection = self._raw_connection(connection)
+            retry_config = raw_connection.cursor_kwargs.get(
+                "retry_config", raw_connection.retry_config
+            )
             if not (
                 isinstance(cause, botocore.exceptions.ClientError)
-                and is_retryable_error(cause, raw_connection.retry_config)  # type: ignore[union-attr]
+                and is_retryable_error(cause, retry_config)
             ):
                 raise
             # The metadata API is still throttled after PyAthena's retries.
@@ -408,18 +424,16 @@ class AthenaDialect(DefaultDialect):
         self, connection: Connection, table_name: str, schema: str | None = None
     ) -> bool:
         raw_connection = self._raw_connection(connection)
-        schema = schema if schema else raw_connection.schema_name  # type: ignore[union-attr]
-        catalog = raw_connection.cursor_kwargs.get("catalog_name", raw_connection.catalog_name)
-        name = (
-            str(table_name).lower()
-            if (catalog or "").lower() == "awsdatacatalog"
-            else str(table_name)
-        )
+        _, schema, name = self._metadata_identity(raw_connection, table_name, schema)
+        # Athena resolves identifiers case-insensitively, so compare names the
+        # same way regardless of how the catalog reports them.
         query = text(
             "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema = :schema AND table_name = :table_name"
+            "WHERE lower(table_schema) = :schema AND lower(table_name) = :table_name"
         )
-        rows = connection.execute(query, {"schema": schema, "table_name": name}).fetchall()
+        rows = connection.execute(
+            query, {"schema": str(schema).lower(), "table_name": str(name).lower()}
+        ).fetchall()
         return bool(rows)
 
     @reflection.cache

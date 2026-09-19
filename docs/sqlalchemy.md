@@ -102,13 +102,13 @@ Table-metadata lookups propagate throttling and permission errors rather than re
 For failed metadata requests, only recognized `EntityNotFoundException` responses establish absence; unrecognized errors are propagated rather than guessed to mean a missing table.
 When a table-metadata request is still throttled after PyAthena's retries, `has_table()` determines existence with a query on `information_schema.tables` and logs a warning.
 This fallback answers only existence: it does not populate the metadata cache, and column, comment, and table-option reflection still propagate the throttling error.
-Athena applies its metadata API rate limits per account; they are not listed in Service Quotas, and throttling episodes can last tens of seconds.
+Athena applies its metadata API rate limits per account, and they are not listed in Service Quotas.
 PyAthena's API retries use exponential backoff with uniform jitter; the default `RetryConfig` makes seven attempts whose waits sum to 63 seconds plus jitter.
 PyAthena recognizes Glue error codes in Athena's `MetadataException` service-error envelope and applies `RetryConfig.exceptions` to those codes.
 `RetryConfig` accepts one exception-name string or an iterable and captures the names as a tuple at construction.
 Changes to the original input list or iterator no longer change the stored policy; construct a new `RetryConfig` when changing the retry policy.
 SDK retries and PyAthena retries are separate layers, so increasing both attempt limits can multiply requests and waiting time.
-Adaptive SDK retries regulate individual clients, not the aggregate traffic from independent CI runners.
+Adaptive SDK retries regulate the request rate of one client; they do not coordinate separate processes.
 For highly concurrent reflection or `checkfirst` DDL, bound the concurrency of metadata requests and consider `botocore.config.Config(retries={"mode": "adaptive"})` on the connection.
 
 Use SQLAlchemy's identifier quoting for reserved words or names beginning with an underscore.
