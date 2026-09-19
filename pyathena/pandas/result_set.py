@@ -586,50 +586,68 @@ class AthenaPandasResultSet(AthenaResultSet):
                 and read_csv_kwargs.get("quoting") != csv.QUOTE_NONE
                 and read_csv_kwargs.get("quotechar", '"') == '"'
             ):
-                # Let pandas resolve duplicate names and aliases using its own header parser.
-                header_buffer = StringIO()
-                csv.writer(header_buffer, quoting=csv.QUOTE_ALL).writerow(
-                    [d[0] for d in description]
-                )
-                header_options = {
-                    key: read_csv_kwargs[key]
-                    for key in (
+                column_names = [d[0] for d in description]
+                converters = read_csv_kwargs["converters"]
+                if (
+                    len(set(column_names)) != len(column_names)
+                    or not all(column_names)
+                    or self._kwargs.keys()
+                    & {
+                        "names",
+                        "usecols",
                         "sep",
                         "delimiter",
-                        "names",
-                        "engine",
-                        "quoting",
-                        "quotechar",
                         "doublequote",
                         "escapechar",
                         "skipinitialspace",
-                    )
-                    if key in read_csv_kwargs
-                }
-                column_names = pd.read_csv(
-                    StringIO(header_buffer.getvalue()), header=0, nrows=0, **header_options
-                ).columns
-                selected_names = pd.read_csv(
-                    StringIO(header_buffer.getvalue()),
-                    header=0,
-                    nrows=0,
-                    usecols=read_csv_kwargs.get("usecols"),
-                    **header_options,
-                ).columns
-                if len(column_names) == len(description):
-                    converters = {
-                        name: self._converter.get(d[1])
-                        for name, d in zip(column_names, description, strict=True)
-                        if d[1] in self._converter.mappings and name in selected_names
                     }
-                    binary_columns = {
-                        i for i in binary_columns if column_names[i] in selected_names
+                ):
+                    # Resolve customized or duplicate column names with pandas.
+                    header_buffer = StringIO()
+                    csv.writer(header_buffer, quoting=csv.QUOTE_ALL).writerow(column_names)
+                    header_options = {
+                        key: read_csv_kwargs[key]
+                        for key in (
+                            "sep",
+                            "delimiter",
+                            "names",
+                            "engine",
+                            "quoting",
+                            "quotechar",
+                            "doublequote",
+                            "escapechar",
+                            "skipinitialspace",
+                        )
+                        if key in read_csv_kwargs
                     }
-                    for index in binary_columns:
-                        name = column_names[index]
-                        converters[name] = partial(_convert_binary_csv, converters[name])
-                else:
-                    binary_columns = set()
+                    column_names = pd.read_csv(
+                        StringIO(header_buffer.getvalue()), header=0, nrows=0, **header_options
+                    ).columns.tolist()
+                    selected_names = set(column_names)
+                    if read_csv_kwargs.get("usecols") is not None:
+                        selected_names = set(
+                            pd.read_csv(
+                                StringIO(header_buffer.getvalue()),
+                                header=0,
+                                nrows=0,
+                                usecols=read_csv_kwargs["usecols"],
+                                **header_options,
+                            ).columns
+                        )
+                    if len(column_names) == len(description):
+                        converters = {
+                            name: self._converter.get(d[1])
+                            for name, d in zip(column_names, description, strict=True)
+                            if d[1] in self._converter.mappings and name in selected_names
+                        }
+                        binary_columns = {
+                            i for i in binary_columns if column_names[i] in selected_names
+                        }
+                    else:
+                        binary_columns = set()
+                for index in binary_columns:
+                    name = column_names[index]
+                    converters[name] = partial(_convert_binary_csv, converters[name])
             else:
                 binary_columns = set()
             if binary_columns:

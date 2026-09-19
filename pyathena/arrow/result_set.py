@@ -317,14 +317,13 @@ class AthenaArrowResultSet(AthenaResultSet):
                     column_types=self.column_types,
                 ),
             )
-            for index, field in enumerate(table.schema):
-                if (
-                    binary_columns
-                    and field.name not in binary_columns
-                    and (pa.types.is_string(field.type) or pa.types.is_binary(field.type))
-                ):
-                    # Preserve the existing CSV behavior for non-binary Athena columns.
-                    table = table.set_column(index, field, table.column(index).fill_null(""))
+            if binary_columns:
+                for index, field in enumerate(table.schema):
+                    if field.name not in binary_columns and (
+                        pa.types.is_string(field.type) or pa.types.is_binary(field.type)
+                    ):
+                        # Preserve the existing CSV behavior for non-binary Athena columns.
+                        table = table.set_column(index, field, table.column(index).fill_null(""))
             return table
         except Exception as e:
             _logger.exception(f"Failed to read {bucket}/{key}.")
