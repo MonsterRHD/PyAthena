@@ -1,5 +1,23 @@
 """Remove expired test database metadata from the caller's default Glue catalog."""
 
+# Usage (from the repository root, with Boto3 credentials and region configured):
+#   uv run --locked --no-dev python scripts/sweep_databases.py
+# Add --apply to delete eligible metadata; the default only previews counts.
+# AWS_PROFILE and AWS_DEFAULT_REGION can select the account and region.
+#
+# Eligible databases must exactly match a PyAthena or SQLAlchemy fixture name
+# and have a creation time more than seven days old. Resource links and federated
+# databases are excluded. The script completes inventory before deleting and
+# rechecks eligibility and creation time immediately before each deletion.
+# Only missing-database errors are ignored; other API failures stop the sweep.
+# Deletion removes Glue database and table metadata, not S3 objects.
+#
+# .github/workflows/database-sweep.yaml runs this script after scheduled Test
+# runs complete on master, including failures and cancellations. It does not run
+# after PR tests or manually dispatched tests. Manual sweep dispatch on master
+# defaults to preview. The job has a 15-minute timeout; a timeout or API failure
+# can leave eligible databases for a later run.
+
 import argparse
 import logging
 import os
