@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import re
 from collections.abc import Mapping, MutableMapping
 from re import Pattern
@@ -10,7 +11,6 @@ from typing import (
     cast,
 )
 
-import botocore
 from sqlalchemy import exc, schema, text, types, util
 from sqlalchemy.engine import Engine, reflection
 from sqlalchemy.engine.default import DefaultDialect
@@ -37,7 +37,7 @@ from pyathena.sqlalchemy.types import (
     get_double_type,
 )
 from pyathena.sqlalchemy.util import _HashableDict
-from pyathena.util import strtobool
+from pyathena.util import THROTTLING_ERROR_CODES, RetryConfig, _get_error_code, strtobool
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -54,6 +54,8 @@ if TYPE_CHECKING:
         ReflectedPrimaryKeyConstraint,
     )
     from sqlalchemy.sql.schema import SchemaItem
+
+_logger = logging.getLogger(__name__)
 
 
 ischema_names: dict[str, type[Any]] = {
@@ -248,59 +250,211 @@ class AthenaDialect(DefaultDialect):
         self._connect_options = opts
         return opts
 
+    @staticmethod
+    def _cursor_option(raw_connection: PoolProxiedConnection, name: str) -> Any:
+        """Return a cursor option, letting ``cursor_kwargs`` override the connection default."""
+        return raw_connection.cursor_kwargs.get(name, getattr(raw_connection, name))
+
+    @staticmethod
+    def _fold_table_name(catalog: str | None, name: str) -> str:
+        """Glue lowercases table names, so ``AwsDataCatalog`` lookups fold case."""
+        return name.lower() if (catalog or "").lower() == "awsdatacatalog" else name
+
     @reflection.cache
     def _get_schemas(self, connection, **kw):
         raw_connection = self._raw_connection(connection)
-        catalog = raw_connection.catalog_name  # type: ignore[union-attr]
+        catalog = self._cursor_option(raw_connection, "catalog_name")
         with raw_connection.driver_connection.cursor() as cursor:  # type: ignore[union-attr]
             try:
                 return cursor.list_databases(catalog)
             except pyathena.error.OperationalError as e:
-                cause = e.__cause__
-                if (
-                    isinstance(cause, botocore.exceptions.ClientError)
-                    and cause.response["Error"]["Code"] == "InvalidRequestException"
-                ):
+                if _get_error_code(e.__cause__ or e) == "InvalidRequestException":
                     return []
                 raise
 
-    @reflection.cache
     def _get_table(self, connection, table_name: str, schema: str | None = None, **kw):
         raw_connection = self._raw_connection(connection)
-        schema = schema if schema else raw_connection.schema_name  # type: ignore[union-attr]
+        catalog = self._cursor_option(raw_connection, "catalog_name")
+        schema = schema if schema else self._cursor_option(raw_connection, "schema_name")
+        name = self._fold_table_name(catalog, str(table_name))
+        # Key by the metadata request, not the reflection method's arguments.
+        # Listings and individual lookups share positive results in this Inspector.
+        info_cache = kw.get("info_cache")
+        if info_cache is None:
+            info_cache = {}
+        cache_key = ("pyathena_table_metadata", catalog, schema, name)
+        metadata = info_cache.get(cache_key)
+        if metadata is not None:
+            return metadata
         with raw_connection.driver_connection.cursor() as cursor:  # type: ignore[union-attr]
-            try:
-                # GetTableMetadata limits table names to 128 characters, while
-                # Athena SQL and ListTableMetadata support longer table names.
-                if len(table_name) > 128:
-                    name = str(table_name).lower()
-                    expression = re.escape(name)
-                    # ListTableMetadata limits its regex filter to 256 characters.
-                    # Unusual catalog names can exceed that after regex escaping.
-                    for metadata in cursor.list_table_metadata(
-                        schema_name=schema,
-                        expression=expression if len(expression) <= 256 else None,
-                        logging_=False,
-                    ):
-                        if metadata.name == name:
-                            return metadata
-                    raise exc.NoSuchTableError(table_name)
-                return cursor.get_table_metadata(table_name, schema_name=schema, logging_=False)
-            except pyathena.error.OperationalError as e:
-                cause = e.__cause__
-                if (
-                    isinstance(cause, botocore.exceptions.ClientError)
-                    and cause.response["Error"]["Code"] == "MetadataException"
-                ):
-                    raise exc.NoSuchTableError(table_name) from e
-                raise
+            metadata = self._lookup_table(cursor, schema, name, table_name)
+        info_cache[cache_key] = metadata
+        return metadata
 
-    @reflection.cache
+    @staticmethod
+    def _lookup_table(cursor: Any, schema: str | None, name: str, table_name: str) -> Any:
+        """Fetch one table's metadata, raising ``NoSuchTableError`` when it is absent."""
+        try:
+            # GetTableMetadata limits table names to 128 characters, while
+            # Athena SQL and ListTableMetadata support longer table names.
+            if len(table_name) > 128:
+                lowered = name.lower()
+                expression = re.escape(lowered)
+                # ListTableMetadata limits its regex filter to 256 characters.
+                # Unusual catalog names can exceed that after regex escaping.
+                listed = cursor.list_table_metadata(
+                    schema_name=schema,
+                    expression=expression if len(expression) <= 256 else None,
+                    logging_=False,
+                )
+                metadata = next(
+                    (m for m in listed if m.name is not None and m.name.lower() == lowered),
+                    None,
+                )
+                if metadata is None:
+                    raise exc.NoSuchTableError(table_name)
+                return metadata
+            return cursor.get_table_metadata(table_name, schema_name=schema, logging_=False)
+        except pyathena.error.OperationalError as e:
+            if _get_error_code(e.__cause__ or e, unwrap_metadata=True) == (
+                "EntityNotFoundException"
+            ):
+                raise exc.NoSuchTableError(table_name) from e
+            raise
+
+    def _get_columns(self, connection, table_name: str, schema: str | None = None, **kw):
+        raw_connection = self._raw_connection(connection)
+        catalog = self._cursor_option(raw_connection, "catalog_name")
+        schema = schema if schema else self._cursor_option(raw_connection, "schema_name")
+        name = self._fold_table_name(catalog, str(table_name))
+        info_cache = kw.get("info_cache")
+        if info_cache is None:
+            info_cache = {}
+        # Columns already reflected from information_schema stay in use until
+        # Inspector.clear_cache(), even if a later listing seeds full metadata.
+        columns_key = ("pyathena_information_schema_columns", catalog, schema, name)
+        columns = info_cache.get(columns_key)
+        if columns is not None:
+            return columns
+        metadata_key = ("pyathena_table_metadata", catalog, schema, name)
+        metadata = info_cache.get(metadata_key)
+        if metadata is not None:
+            return self._columns_from_metadata(metadata)
+        # A throttled metadata request switches to information_schema at once
+        # instead of waiting out the retry policy; the query answers existence
+        # and columns, while table comments and options still need the API.
+        # Other retryable codes keep the connection's policy. Connection.cursor()
+        # applies cursor_kwargs last, so a retry_config given there still runs
+        # its own throttling retries before the fallback.
+        retry_config = self._without_throttling_retries(
+            raw_connection.retry_config  # type: ignore[union-attr]
+        )
+        with raw_connection.driver_connection.cursor(  # type: ignore[union-attr]
+            retry_config=retry_config
+        ) as cursor:
+            try:
+                metadata = self._lookup_table(cursor, schema, name, table_name)
+            except pyathena.error.OperationalError as e:
+                if (
+                    _get_error_code(e.__cause__ or e, unwrap_metadata=True)
+                    not in THROTTLING_ERROR_CODES
+                ):
+                    raise
+                _logger.warning(
+                    f"Table metadata request for {table_name} was throttled; "
+                    "reflecting columns from information_schema."
+                )
+                columns = self._columns_from_information_schema(raw_connection, schema, name)
+                if not columns:
+                    raise exc.NoSuchTableError(table_name) from e
+                info_cache[columns_key] = columns
+                return columns
+        info_cache[metadata_key] = metadata
+        return self._columns_from_metadata(metadata)
+
+    @staticmethod
+    def _without_throttling_retries(retry_config: RetryConfig) -> RetryConfig:
+        """Copy a policy without the codes that carry throttling.
+
+        Athena wraps Glue throttling in ``MetadataException``, so that code is
+        dropped as well; specific wrapped codes stay retryable.
+        """
+        excluded = (*THROTTLING_ERROR_CODES, "MetadataException")
+        return RetryConfig(
+            exceptions=[c for c in retry_config.exceptions if c not in excluded],
+            attempt=retry_config.attempt,
+            multiplier=retry_config.multiplier,
+            max_delay=retry_config.max_delay,
+            exponential_base=retry_config.exponential_base,
+        )
+
+    def _column(self, name: str | None, type_: str, comment: str | None, partition: bool | None):
+        return {
+            "name": name,
+            "type": self._get_column_type(type_),
+            "nullable": True,
+            "default": None,
+            "autoincrement": False,
+            "comment": comment,
+            "dialect_options": {"awsathena_partition": partition},
+        }
+
+    def _columns_from_metadata(self, metadata: Any):
+        return [self._column(c.name, c.type, c.comment, None) for c in metadata.columns] + [
+            self._column(c.name, c.type, c.comment, True) for c in metadata.partition_keys
+        ]
+
+    def _columns_from_information_schema(
+        self, raw_connection: PoolProxiedConnection, schema: str | None, table_name: str
+    ):
+        # Athena resolves identifiers case-insensitively and information_schema
+        # reports lowercase names; plain equality keeps the filter pushed down.
+        # The answer must reflect the catalog now, so query result reuse is off.
+        schema = str(schema).lower().replace("'", "''")
+        table_name = table_name.lower().replace("'", "''")
+        with raw_connection.driver_connection.cursor() as cursor:  # type: ignore[union-attr]
+            cursor.execute(
+                "SELECT ordinal_position, column_name, data_type, comment, extra_info "
+                "FROM information_schema.columns "
+                f"WHERE table_schema = '{schema}' AND table_name = '{table_name}'",
+                result_reuse_enable=False,
+            )
+            rows = cursor.fetchall()
+        # Sort here: UNLOAD-backed cursors do not preserve ORDER BY. Cursors that
+        # read NULL as NaN must not turn a missing comment into a value.
+        return [
+            self._column(
+                column_name,
+                data_type,
+                comment if isinstance(comment, str) else None,
+                extra_info == "partition key" or None,
+            )
+            for _, column_name, data_type, comment, extra_info in sorted(
+                rows, key=lambda row: int(row[0])
+            )
+        ]
+
     def _get_tables(self, connection, schema: str | None = None, **kw):
         raw_connection = self._raw_connection(connection)
-        schema = schema if schema else raw_connection.schema_name  # type: ignore[union-attr]
+        catalog = self._cursor_option(raw_connection, "catalog_name")
+        schema = schema if schema else self._cursor_option(raw_connection, "schema_name")
+        info_cache = kw.get("info_cache")
+        if info_cache is None:
+            info_cache = {}
+        cache_key = ("pyathena_table_metadata_list", catalog, schema)
+        tables = info_cache.get(cache_key)
+        if tables is not None:
+            return tables
         with raw_connection.driver_connection.cursor() as cursor:  # type: ignore[union-attr]
-            return cursor.list_table_metadata(schema_name=schema)
+            tables = cursor.list_table_metadata(schema_name=schema)
+        info_cache[cache_key] = tables
+        for metadata in tables:
+            if metadata.name is None:
+                continue
+            name = self._fold_table_name(catalog, metadata.name)
+            # Preserve earlier reflection results until Inspector.clear_cache().
+            info_cache.setdefault(("pyathena_table_metadata", catalog, schema, name), metadata)
+        return tables
 
     def get_schema_names(self, connection, **kw):
         schemas = self._get_schemas(connection, **kw)
@@ -347,8 +501,7 @@ class AthenaDialect(DefaultDialect):
     @reflection.cache
     def has_table(self, connection: Connection, table_name: str, schema: str | None = None, **kw):
         try:
-            columns = self.get_columns(connection, table_name, schema, **kw)
-            return bool(columns)
+            return bool(self.get_columns(connection, table_name, schema, **kw))
         except exc.NoSuchTableError:
             return False
 
@@ -357,7 +510,7 @@ class AthenaDialect(DefaultDialect):
         self, connection: Connection, view_name: str, schema: str | None = None, **kw
     ):
         raw_connection = self._raw_connection(connection)
-        schema = schema if schema else raw_connection.schema_name  # type: ignore[union-attr]
+        schema = schema if schema else self._cursor_option(raw_connection, "schema_name")
         query = f"""SHOW CREATE VIEW "{schema}"."{view_name}";"""
         try:
             res = connection.scalars(text(query))
@@ -368,32 +521,7 @@ class AthenaDialect(DefaultDialect):
 
     @reflection.cache
     def get_columns(self, connection: Connection, table_name: str, schema: str | None = None, **kw):
-        metadata = self._get_table(connection, table_name, schema=schema, **kw)
-        columns = [
-            {
-                "name": c.name,
-                "type": self._get_column_type(c.type),
-                "nullable": True,
-                "default": None,
-                "autoincrement": False,
-                "comment": c.comment,
-                "dialect_options": {"awsathena_partition": None},
-            }
-            for c in metadata.columns
-        ]
-        columns += [
-            {
-                "name": c.name,
-                "type": self._get_column_type(c.type),
-                "nullable": True,
-                "default": None,
-                "autoincrement": False,
-                "comment": c.comment,
-                "dialect_options": {"awsathena_partition": True},
-            }
-            for c in metadata.partition_keys
-        ]
-        return columns
+        return self._get_columns(connection, table_name, schema=schema, **kw)
 
     def _get_column_type(self, type_: str):
         match = self._pattern_column_type.match(type_)

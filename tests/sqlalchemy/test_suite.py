@@ -1,6 +1,7 @@
 import logging
 
 import pytest
+from botocore.exceptions import ClientError
 from sqlalchemy import CHAR, VARCHAR, Integer, String, func, inspect, select
 from sqlalchemy import exc as sa_exc
 from sqlalchemy import testing as sa_testing
@@ -18,6 +19,38 @@ from sqlalchemy.testing.suite import LongNameBlowoutTest as _LongNameBlowoutTest
 from sqlalchemy.testing.suite import QuotedNameArgumentTest as _QuotedNameArgumentTest
 from sqlalchemy.testing.suite import SimpleUpdateDeleteTest as _SimpleUpdateDeleteTest
 from sqlalchemy.testing.suite import StringTest as _StringTest
+
+from pyathena.error import OperationalError
+
+
+def _raw_connection(connection):
+    """Return the PyAthena connection behind a SQLAlchemy connection for either dialect."""
+    raw_connection = connection.connection.driver_connection
+    if connection.dialect.is_async:
+        raw_connection = raw_connection.driver_connection
+    return raw_connection
+
+
+def _metadata_error(code, message):
+    return ClientError({"Error": {"Code": code, "Message": message}}, "GetTableMetadata")
+
+
+def _fail_get_table_metadata(monkeypatch, raw_connection, error, attempt=1):
+    """Make every GetTableMetadata call raise ``error``; return the call list.
+
+    ``attempt`` shortens the connection's retry policy; ``None`` leaves it as is.
+    """
+    calls = []
+
+    def fail_metadata(**kwargs):
+        calls.append(kwargs)
+        raise error
+
+    monkeypatch.setattr(raw_connection.client, "get_table_metadata", fail_metadata)
+    if attempt is not None:
+        monkeypatch.setattr(raw_connection.retry_config, "attempt", attempt)
+    return calls
+
 
 del BinaryTest  # noqa: F821
 del CompositeKeyReflectionTest  # noqa: F821
@@ -115,6 +148,89 @@ class ComponentReflectionTest(_ComponentReflectionTest):
 
 
 class ComponentReflectionTestExtra(_ComponentReflectionTestExtra):
+    @sa_testing.combinations(True, False, argnames="list_first")
+    @sa_testing.combinations(True, False, argnames="cursor_catalog")
+    def test_reuses_table_metadata(
+        self, connection, metadata, monkeypatch, caplog, list_first, cursor_catalog
+    ):
+        table = Table("listed_metadata", metadata, Column("id", Integer, comment="identifier"))
+        table.create(connection)
+        inspector = inspect(connection)
+        raw_connection = _raw_connection(connection)
+        caplog.set_level(logging.WARNING, logger="pyathena.sqlalchemy.base")
+        if cursor_catalog:
+            monkeypatch.setitem(
+                raw_connection.cursor_kwargs, "catalog_name", raw_connection.catalog_name
+            )
+            monkeypatch.setattr(raw_connection, "catalog_name", None)
+        client = raw_connection.client
+        calls = []
+
+        def record_call(model, **kwargs):
+            calls.append(model.name)
+
+        client.meta.events.register("before-call.athena", record_call)
+        try:
+            schema = raw_connection.schema_name
+            if list_first:
+                assert table.name in inspector.get_table_names()
+                listed_calls = list(calls)
+                assert table.name in inspector.get_table_names(schema=schema)
+                assert table.name not in inspector.get_view_names(schema=schema)
+                assert calls == listed_calls
+            assert inspector.get_columns(table.name)[0]["comment"] == "identifier"
+            if any("information_schema" in record.getMessage() for record in caplog.records):
+                # The request counts below assume metadata served by the API.
+                pytest.skip("table metadata was throttled; columns came from information_schema")
+            initial_calls = list(calls)
+            assert inspector.get_columns(table.name, schema=schema)[0]["name"] == "id"
+            assert inspector.get_table_options(table.name, schema=schema)["awsathena_location"]
+            assert inspector.get_table_comment(table.name, schema=schema) == {"text": None}
+            assert inspector.has_table(table.name.upper(), schema=schema)
+            assert calls == initial_calls
+            if list_first:
+                assert "ListTableMetadata" in calls
+                assert "GetTableMetadata" not in calls
+                assert (
+                    inspector.get_multi_columns(schema=schema, filter_names=[table.name])[
+                        (schema, table.name)
+                    ][0]["name"]
+                    == "id"
+                )
+                assert calls == initial_calls
+            calls.clear()
+            inspector.clear_cache()
+            assert inspector.get_columns(table.name)[0]["name"] == "id"
+            # A fresh lookup may retry when Athena throttles metadata requests.
+            metadata_calls = calls.count("GetTableMetadata")
+            assert metadata_calls > 0
+            assert inspector.get_columns(table.name)[0]["name"] == "id"
+            assert calls.count("GetTableMetadata") == metadata_calls
+            if list_first:
+                assert table.name in inspector.get_table_names(schema=schema)
+                assert "ListTableMetadata" in calls
+        finally:
+            client.meta.events.unregister("before-call.athena", record_call)
+
+    def test_preserves_table_metadata_until_clear_cache(self, connection, metadata):
+        table = Table("cached_metadata", metadata, Column("id", Integer))
+        table.create(connection)
+        inspector = inspect(connection)
+        assert [column["name"] for column in inspector.get_columns(table.name)] == ["id"]
+        table_name = connection.dialect.identifier_preparer.format_table(table)
+        connection.exec_driver_sql(f"ALTER TABLE {table_name} ADD COLUMNS (added string)")
+        assert [column["name"] for column in inspect(connection).get_columns(table.name)] == [
+            "id",
+            "added",
+        ]
+        assert table.name in inspector.get_table_names()
+        schema = connection.connection.schema_name
+        assert [column["name"] for column in inspector.get_columns(table.name, schema=schema)] == [
+            "id"
+        ]
+        inspector.clear_cache()
+        assert [column["name"] for column in inspector.get_columns(table.name)] == ["id", "added"]
+
     @sa_testing.combinations((String, None), (VARCHAR, 52), (CHAR, 52), argnames="type_,length")
     def test_hive_string_length_reflection(self, connection, metadata, type_, length):
         table = Table(
@@ -180,6 +296,102 @@ class LongNameBlowoutTest(_LongNameBlowoutTest):
 
 
 class HasTableTest(_HasTableTest):
+    @sa_testing.combinations(True, False, argnames="exists")
+    def test_throttled_metadata_requests_use_information_schema(
+        self, connection, metadata, monkeypatch, exists
+    ):
+        name = "throttled_columns" if exists else "throttled_missing"
+        if exists:
+            Table(
+                name,
+                metadata,
+                Column("id", Integer, comment="identifier"),
+                Column("label", String),
+            ).create(connection)
+        raw_connection = _raw_connection(connection)
+        # Retries are not shortened: the fallback must not wait for them.
+        error = _metadata_error("ThrottlingException", "Rate exceeded")
+        calls = _fail_get_table_metadata(monkeypatch, raw_connection, error, attempt=None)
+        # The fallback must answer from the catalog even when result reuse is on.
+        monkeypatch.setitem(raw_connection.cursor_kwargs, "result_reuse_enable", True)
+        queries = []
+
+        def record_query(params, **kwargs):
+            queries.append(params)
+
+        event = "provide-client-params.athena.StartQueryExecution"
+        raw_connection.client.meta.events.register(event, record_query)
+        try:
+            inspector = inspect(connection)
+            assert inspector.has_table(name) is exists
+            assert inspector.has_table(name.upper(), schema=raw_connection.schema_name) is exists
+            if exists:
+                columns = inspector.get_columns(name)
+                assert [column["name"] for column in columns] == ["id", "label"]
+                assert columns[0]["comment"] == "identifier"
+                assert isinstance(columns[0]["type"], Integer)
+                assert isinstance(columns[1]["type"], String)
+                assert all(
+                    column["dialect_options"]["awsathena_partition"] is None for column in columns
+                )
+                # A later listing seeds full metadata but does not replace the
+                # fallback columns; clear_cache() does. A new argument
+                # combination bypasses reflection.cache and reaches the dialect.
+                assert name in inspector.get_table_names()
+                assert inspector.get_columns(name, schema=raw_connection.schema_name) is columns
+                inspector.clear_cache()
+                assert inspector.get_columns(name) is not columns
+            else:
+                with pytest.raises(sa_exc.NoSuchTableError):
+                    inspector.get_columns(name)
+        finally:
+            raw_connection.client.meta.events.unregister(event, record_query)
+        # One metadata attempt, then one information_schema query per lookup.
+        # Reflected columns are reused by case and schema variants; absence is not.
+        assert len(calls) == (2 if exists else 3)
+        assert len(queries) == len(calls)
+        for query in queries:
+            assert "FROM information_schema.columns" in query["QueryString"]
+            assert "WHERE table_schema = " in query["QueryString"]
+            assert "lower(" not in query["QueryString"]
+            reuse = query["ResultReuseConfiguration"]["ResultReuseByAgeConfiguration"]
+            assert reuse["Enabled"] is False
+        # Table options need the metadata API and still report the throttled request.
+        monkeypatch.setattr(raw_connection.retry_config, "attempt", 1)
+        with pytest.raises(OperationalError) as caught:
+            inspector.get_table_options(name)
+        assert caught.value.__cause__ is error
+
+    @sa_testing.combinations(
+        "AccessDeniedException", "InternalServerException", None, argnames="code"
+    )
+    def test_metadata_errors_do_not_establish_absence(self, connection, monkeypatch, code):
+        raw_connection = _raw_connection(connection)
+        retried = code == "InternalServerException"
+        if retried:
+            # A code the retry policy covers is retried with that policy, then
+            # propagates; it does not reach the information_schema fallback.
+            monkeypatch.setattr(
+                raw_connection.retry_config, "exceptions", ("ThrottlingException", code)
+            )
+            monkeypatch.setattr(raw_connection.retry_config, "multiplier", 0)
+        message = (
+            "Catalog error (Service: AmazonDataCatalog; Status Code: 400; "
+            f"Error Code: {code}; Request ID: example; Proxy: null)"
+            if code
+            else "Table not found"
+        )
+        error = _metadata_error("MetadataException", message)
+        calls = _fail_get_table_metadata(
+            monkeypatch, raw_connection, error, attempt=2 if retried else 1
+        )
+        inspector = inspect(connection)
+        for _ in range(2):
+            with pytest.raises(OperationalError) as caught:
+                inspector.has_table("unavailable_metadata")
+            assert caught.value.__cause__ is error
+        assert len(calls) == (4 if retried else 2)
+
     @sa_testing.combinations((True, sa_testing.requires.schemas), False, argnames="use_schema")
     def test_has_table_cache_drop(self, connection, metadata, use_schema):
         schema = sa_testing.config.test_schema if use_schema else None

@@ -6,6 +6,10 @@ on:
       test-type:
         required: true
         type: string
+      max-parallel:
+        description: Maximum number of Python versions tested concurrently
+        type: number
+        default: 5
 
 jobs:
   run:
@@ -14,10 +18,9 @@ jobs:
     env:
       TEST_TYPE: ${{ inputs.test-type }}
       AWS_DEFAULT_REGION: us-west-2
-      # Reflection bursts can exceed the metadata API rate quota even when
-      # concurrent DDL queries stay below their quota.
-      AWS_RETRY_MODE: adaptive
-      AWS_MAX_ATTEMPTS: '10'
+      # Keep SDK retries bounded; PyAthena also retries wrapped catalog errors.
+      AWS_RETRY_MODE: standard
+      AWS_MAX_ATTEMPTS: '3'
       AWS_ATHENA_S3_STAGING_DIR: s3://laughingman7743-pyathena/github/
       AWS_ATHENA_WORKGROUP: pyathena
       AWS_ATHENA_SPARK_WORKGROUP: pyathena-spark
@@ -30,6 +33,7 @@ jobs:
 
     strategy:
       fail-fast: false
+      max-parallel: ${{ inputs.max-parallel }}
       matrix:
         python-version: ['3.10', '3.11', '3.12', '3.13', '3.14']
 

@@ -1,14 +1,17 @@
+import contextlib
 import re
 import textwrap
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 from urllib.parse import quote_plus
 
 import numpy as np
 import pandas as pd
 import pytest
 import sqlalchemy
+from botocore.exceptions import ClientError
 from sqlalchemy import create_engine, func, literal_column, select, text, types
 from sqlalchemy.exc import NoSuchTableError
 from sqlalchemy.sql import expression, type_coerce
@@ -16,6 +19,8 @@ from sqlalchemy.sql.ddl import CreateTable
 from sqlalchemy.sql.schema import Column, MetaData, Table
 from sqlalchemy.sql.selectable import TextualSelect
 
+from pyathena.error import OperationalError
+from pyathena.sqlalchemy.base import AthenaDialect
 from pyathena.sqlalchemy.types import (
     TINYINT,
     AthenaArray,
@@ -24,6 +29,7 @@ from pyathena.sqlalchemy.types import (
     Tinyint,
     get_double_type,
 )
+from pyathena.util import RetryConfig
 from tests.pyathena.conftest import ENV
 
 # Amazon S3 Tables tests need a pre-provisioned table-bucket catalog and namespace.
@@ -44,6 +50,140 @@ def unique_s3tables_table_name(base: str) -> str:
     would collide across those concurrent jobs; a random suffix keeps them apart.
     """
     return f"{base}_{uuid.uuid4().hex[:8]}"
+
+
+class TestAthenaDialect:
+    def test_columns_from_information_schema(self):
+        # Rows arrive unordered, and a cursor may read a NULL comment as NaN.
+        rows = [
+            ("3", "dt", "varchar", float("nan"), "partition key"),
+            ("1", "id", "integer", "identifier", None),
+            ("2", "payload", "row(a integer, b array(varchar))", None, None),
+        ]
+        executed = []
+
+        def execute(operation, **kwargs):
+            executed.append((operation, kwargs))
+
+        cursor = SimpleNamespace(execute=execute, fetchall=lambda: rows)
+        raw_connection = SimpleNamespace(
+            driver_connection=SimpleNamespace(cursor=lambda: contextlib.nullcontext(cursor))
+        )
+
+        columns = AthenaDialect()._columns_from_information_schema(
+            raw_connection, "My_Schema", "O'Neil"
+        )
+
+        assert [column["name"] for column in columns] == ["id", "payload", "dt"]
+        assert isinstance(columns[0]["type"], types.INTEGER)
+        assert columns[0]["comment"] == "identifier"
+        assert isinstance(columns[1]["type"], AthenaStruct)
+        assert isinstance(columns[2]["type"], types.VARCHAR)
+        assert columns[2]["comment"] is None
+        assert [column["dialect_options"]["awsathena_partition"] for column in columns] == [
+            None,
+            None,
+            True,
+        ]
+        ((operation, kwargs),) = executed
+        assert "WHERE table_schema = 'my_schema' AND table_name = 'o''neil'" in operation
+        assert kwargs == {"result_reuse_enable": False}
+
+    def test_without_throttling_retries_keeps_other_codes(self):
+        policy = RetryConfig(
+            exceptions=(
+                "ThrottlingException",
+                "TooManyRequestsException",
+                "MetadataException",
+                "InternalServerException",
+            ),
+            attempt=10,
+            multiplier=2,
+            max_delay=30,
+            exponential_base=3,
+        )
+        derived = AthenaDialect._without_throttling_retries(policy)
+        # MetadataException carries wrapped throttling, so it is dropped as well.
+        assert derived.exceptions == ("InternalServerException",)
+        assert (derived.attempt, derived.multiplier, derived.max_delay) == (10, 2, 30)
+        assert derived.exponential_base == 3
+
+    def test_cursor_schema_applies_to_lookup_fallback_and_cache(self):
+        # A schema given in cursor_kwargs is the one the cursor queries, so the
+        # metadata request, the information_schema fallback and the cache keys
+        # must all use it when the connection has no schema of its own.
+        error = ClientError(
+            {"Error": {"Code": "ThrottlingException", "Message": "Rate exceeded"}},
+            "GetTableMetadata",
+        )
+        requests = []
+        executed = []
+
+        def get_table_metadata(table_name, **kwargs):
+            requests.append(kwargs)
+            raise OperationalError(*error.args) from error
+
+        cursor = SimpleNamespace(
+            get_table_metadata=get_table_metadata,
+            execute=lambda operation, **kwargs: executed.append(operation),
+            fetchall=lambda: [("1", "id", "integer", None, None)],
+        )
+        raw_connection = SimpleNamespace(
+            cursor_kwargs={"schema_name": "analytics"},
+            catalog_name="awsdatacatalog",
+            schema_name=None,
+            retry_config=RetryConfig(),
+            driver_connection=SimpleNamespace(
+                cursor=lambda **kwargs: contextlib.nullcontext(cursor)
+            ),
+        )
+        connection = SimpleNamespace(connection=raw_connection)
+        info_cache = {}
+
+        columns = AthenaDialect()._get_columns(connection, "Events", info_cache=info_cache)
+
+        assert [column["name"] for column in columns] == ["id"]
+        assert requests == [{"schema_name": "analytics", "logging_": False}]
+        assert "WHERE table_schema = 'analytics' AND table_name = 'events'" in executed[0]
+        assert list(info_cache) == [
+            ("pyathena_information_schema_columns", "awsdatacatalog", "analytics", "events")
+        ]
+
+    def test_get_table_matches_long_names_case_insensitively(self):
+        # GetTableMetadata rejects names over 128 characters, so the lookup lists
+        # with a lowercase filter and matches the catalog's own casing.
+        table_name = "Long" + "x" * 130
+        listed = SimpleNamespace(name=table_name.lower(), columns=[], partition_keys=[])
+        requests = []
+
+        def list_table_metadata(**kwargs):
+            requests.append(kwargs)
+            return [listed]
+
+        cursor = SimpleNamespace(list_table_metadata=list_table_metadata)
+        raw_connection = SimpleNamespace(
+            cursor_kwargs={},
+            catalog_name="other_catalog",
+            schema_name="default",
+            driver_connection=SimpleNamespace(cursor=lambda: contextlib.nullcontext(cursor)),
+        )
+        connection = SimpleNamespace(connection=raw_connection)
+        info_cache = {}
+
+        metadata = AthenaDialect()._get_table(connection, table_name, info_cache=info_cache)
+
+        assert metadata is listed
+        assert requests == [
+            {
+                "schema_name": "default",
+                "expression": re.escape(table_name.lower()),
+                "logging_": False,
+            }
+        ]
+        # Outside AwsDataCatalog the cache keeps the caller's casing.
+        assert info_cache == {
+            ("pyathena_table_metadata", "other_catalog", "default", table_name): listed
+        }
 
 
 class TestSQLAlchemyAthena:
@@ -2069,6 +2209,7 @@ OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
         )
 
         try:
+            assert not sqlalchemy.inspect(conn).has_table(table_name, schema=schema)
             table.create(bind=conn)
             actual = Table(table_name, MetaData(schema=schema), autoload_with=conn)
             tblproperties = actual.dialect_options["awsathena"]["tblproperties"]
