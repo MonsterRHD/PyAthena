@@ -78,7 +78,7 @@ class TestAthenaDialect:
         assert isinstance(columns[0]["type"], types.INTEGER)
         assert columns[0]["comment"] == "identifier"
         assert isinstance(columns[1]["type"], AthenaStruct)
-        assert isinstance(columns[2]["type"], types.VARCHAR)
+        assert type(columns[2]["type"]) is types.String
         assert columns[2]["comment"] is None
         assert [column["dialect_options"]["awsathena_partition"] for column in columns] == [
             None,
