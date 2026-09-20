@@ -686,13 +686,15 @@ class TestSQLAlchemyAthena:
         finally:
             raw_connection.client.meta.events.unregister(event, record_query)
 
-        # get_columns() reuses the reflected columns, so the fallback ran once,
-        # and it ran in the mode this case asked for. Without this, an unload
-        # option that stopped reaching the cursor would leave every case green
-        # while three of them silently tested CSV twice.
-        (fallback,) = queries
-        assert "FROM information_schema.columns" in fallback
-        assert fallback.strip().startswith("UNLOAD (") is unload
+        # Reflection issued the fallback and nothing else, in the mode this case
+        # asked for. Without the mode check, an unload option that stopped
+        # reaching the cursor would leave every case green while three of them
+        # silently tested CSV twice. The count is not pinned: a throttled
+        # StartQueryExecution is retried through the same client hook.
+        assert queries
+        for query in queries:
+            assert "FROM information_schema.columns" in query
+            assert query.strip().startswith("UNLOAD (") is unload
 
         # The fallback query has no ORDER BY, so this order comes from the
         # client-side ordinal_position sort, and every missing-comment shape a
