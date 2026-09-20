@@ -465,6 +465,10 @@ class SparkBaseCursor(BaseCursor, metaclass=ABCMeta):
                 ) from errors[0]
             session_error = self._release_owned_session()
             if session_error is not None:
+                if isinstance(session_error, BaseException) and not isinstance(
+                    session_error, Exception
+                ):
+                    raise session_error
                 raise OperationalError(
                     f"Failed to fully close Spark cursor for session "
                     f"{self._session_id}. Retrying close() reattempts the unfinished "
