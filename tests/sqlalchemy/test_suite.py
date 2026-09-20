@@ -356,11 +356,14 @@ class HasTableTest(_HasTableTest):
     )
     def test_metadata_errors_do_not_establish_absence(self, connection, monkeypatch, code):
         raw_connection = _raw_connection(connection)
-        if code == "InternalServerException":
-            # A code the retry policy covers still does not reach the existence fallback.
+        retried = code == "InternalServerException"
+        if retried:
+            # A code the retry policy covers is retried with that policy, then
+            # propagates; it does not reach the information_schema fallback.
             monkeypatch.setattr(
                 raw_connection.retry_config, "exceptions", ("ThrottlingException", code)
             )
+            monkeypatch.setattr(raw_connection.retry_config, "multiplier", 0)
         message = (
             "Catalog error (Service: AmazonDataCatalog; Status Code: 400; "
             f"Error Code: {code}; Request ID: example; Proxy: null)"
@@ -368,13 +371,15 @@ class HasTableTest(_HasTableTest):
             else "Table not found"
         )
         error = _metadata_error("MetadataException", message)
-        calls = _fail_get_table_metadata(monkeypatch, raw_connection, error)
+        calls = _fail_get_table_metadata(
+            monkeypatch, raw_connection, error, attempt=2 if retried else 1
+        )
         inspector = inspect(connection)
         for _ in range(2):
             with pytest.raises(OperationalError) as caught:
                 inspector.has_table("unavailable_metadata")
             assert caught.value.__cause__ is error
-        assert len(calls) == 2
+        assert len(calls) == (4 if retried else 2)
 
     @sa_testing.combinations((True, sa_testing.requires.schemas), False, argnames="use_schema")
     def test_has_table_cache_drop(self, connection, metadata, use_schema):

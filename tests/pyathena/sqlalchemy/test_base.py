@@ -27,6 +27,7 @@ from pyathena.sqlalchemy.types import (
     Tinyint,
     get_double_type,
 )
+from pyathena.util import RetryConfig
 from tests.pyathena.conftest import ENV
 
 # Amazon S3 Tables tests need a pre-provisioned table-bucket catalog and namespace.
@@ -51,10 +52,11 @@ def unique_s3tables_table_name(base: str) -> str:
 
 class TestAthenaDialect:
     def test_columns_from_information_schema(self):
+        # Rows arrive unordered, and a cursor may read a NULL comment as NaN.
         rows = [
-            ("id", "integer", "identifier", None),
-            ("payload", "row(a integer, b array(varchar))", None, None),
-            ("dt", "varchar", None, "partition key"),
+            ("3", "dt", "varchar", float("nan"), "partition key"),
+            ("1", "id", "integer", "identifier", None),
+            ("2", "payload", "row(a integer, b array(varchar))", None, None),
         ]
         executed = []
 
@@ -75,6 +77,7 @@ class TestAthenaDialect:
         assert columns[0]["comment"] == "identifier"
         assert isinstance(columns[1]["type"], AthenaStruct)
         assert isinstance(columns[2]["type"], types.VARCHAR)
+        assert columns[2]["comment"] is None
         assert [column["dialect_options"]["awsathena_partition"] for column in columns] == [
             None,
             None,
@@ -82,8 +85,20 @@ class TestAthenaDialect:
         ]
         ((operation, kwargs),) = executed
         assert "WHERE table_schema = 'my_schema' AND table_name = 'o''neil'" in operation
-        assert "ORDER BY ordinal_position" in operation
         assert kwargs == {"result_reuse_enable": False}
+
+    def test_without_throttling_retries_keeps_other_codes(self):
+        policy = RetryConfig(
+            exceptions=("ThrottlingException", "InternalServerException"),
+            attempt=10,
+            multiplier=2,
+            max_delay=30,
+            exponential_base=3,
+        )
+        derived = AthenaDialect._without_throttling_retries(policy)
+        assert derived.exceptions == ("InternalServerException",)
+        assert (derived.attempt, derived.multiplier, derived.max_delay) == (10, 2, 30)
+        assert derived.exponential_base == 3
 
     def test_get_table_matches_long_names_case_insensitively(self):
         # GetTableMetadata rejects names over 128 characters, so the lookup lists

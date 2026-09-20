@@ -57,10 +57,6 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
-# Column reflection makes one metadata attempt and then answers from
-# information_schema, so a throttled request does not wait out the retry policy.
-_SINGLE_ATTEMPT = RetryConfig(attempt=1)
-
 
 ischema_names: dict[str, type[Any]] = {
     "boolean": types.BOOLEAN,
@@ -345,8 +341,12 @@ class AthenaDialect(DefaultDialect):
         # A throttled metadata request switches to information_schema at once
         # instead of waiting out the retry policy; the query answers existence
         # and columns, while table comments and options still need the API.
+        # Other retryable codes keep the connection's policy.
+        retry_config = self._without_throttling_retries(
+            self._cursor_option(raw_connection, "retry_config")
+        )
         with raw_connection.driver_connection.cursor(  # type: ignore[union-attr]
-            retry_config=_SINGLE_ATTEMPT
+            retry_config=retry_config
         ) as cursor:
             try:
                 metadata = self._lookup_table(cursor, schema, name, table_name)
@@ -367,6 +367,16 @@ class AthenaDialect(DefaultDialect):
                 return columns
         info_cache[metadata_key] = metadata
         return self._columns_from_metadata(metadata)
+
+    @staticmethod
+    def _without_throttling_retries(retry_config: RetryConfig) -> RetryConfig:
+        return RetryConfig(
+            exceptions=[c for c in retry_config.exceptions if c not in THROTTLING_ERROR_CODES],
+            attempt=retry_config.attempt,
+            multiplier=retry_config.multiplier,
+            max_delay=retry_config.max_delay,
+            exponential_base=retry_config.exponential_base,
+        )
 
     def _column(self, name: str | None, type_: str, comment: str | None, partition: bool | None):
         return {
@@ -394,16 +404,24 @@ class AthenaDialect(DefaultDialect):
         table_name = table_name.lower().replace("'", "''")
         with raw_connection.driver_connection.cursor() as cursor:  # type: ignore[union-attr]
             cursor.execute(
-                "SELECT column_name, data_type, comment, extra_info "
+                "SELECT ordinal_position, column_name, data_type, comment, extra_info "
                 "FROM information_schema.columns "
-                f"WHERE table_schema = '{schema}' AND table_name = '{table_name}' "
-                "ORDER BY ordinal_position",
+                f"WHERE table_schema = '{schema}' AND table_name = '{table_name}'",
                 result_reuse_enable=False,
             )
             rows = cursor.fetchall()
+        # Sort here: UNLOAD-backed cursors do not preserve ORDER BY. Cursors that
+        # read NULL as NaN must not turn a missing comment into a value.
         return [
-            self._column(column_name, data_type, comment, extra_info == "partition key" or None)
-            for column_name, data_type, comment, extra_info in rows
+            self._column(
+                column_name,
+                data_type,
+                comment if isinstance(comment, str) else None,
+                extra_info == "partition key" or None,
+            )
+            for _, column_name, data_type, comment, extra_info in sorted(
+                rows, key=lambda row: int(row[0])
+            )
         ]
 
     def _get_tables(self, connection, schema: str | None = None, **kw):
