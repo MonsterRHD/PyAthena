@@ -101,7 +101,8 @@ Table-metadata lookups propagate throttling and permission errors rather than re
 `has_table()` propagates permission failures, including access denied by Lake Formation, instead of returning or caching `False`.
 For failed metadata requests, only recognized `EntityNotFoundException` responses establish absence; unrecognized errors are propagated rather than guessed to mean a missing table.
 Column reflection and `has_table()` do not retry a throttled table-metadata request; when Athena reports throttling, they read `information_schema.columns` instead, executed without query result reuse, and log a warning.
-Other error codes listed in `RetryConfig.exceptions` are still retried with the connection's policy on that path; a `retry_config` in `cursor_kwargs` takes precedence.
+Other error codes listed in the connection's `RetryConfig.exceptions` are still retried on that path.
+A `retry_config` in `cursor_kwargs` replaces that policy entirely, including its throttling retries, which then run before the fallback.
 Columns reflected this way carry the type names Athena reports there, such as `varchar` for `string`, and partition columns are marked from its `extra_info` column.
 This fallback does not populate the table-metadata cache, and table comments and table options still come from the metadata API with the configured retries, so they propagate the throttling error.
 Athena applies its metadata API rate limits per account, and they are not listed in Service Quotas.

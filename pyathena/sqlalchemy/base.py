@@ -341,9 +341,11 @@ class AthenaDialect(DefaultDialect):
         # A throttled metadata request switches to information_schema at once
         # instead of waiting out the retry policy; the query answers existence
         # and columns, while table comments and options still need the API.
-        # Other retryable codes keep the connection's policy.
+        # Other retryable codes keep the connection's policy. Connection.cursor()
+        # applies cursor_kwargs last, so a retry_config given there still runs
+        # its own throttling retries before the fallback.
         retry_config = self._without_throttling_retries(
-            self._cursor_option(raw_connection, "retry_config")
+            raw_connection.retry_config  # type: ignore[union-attr]
         )
         with raw_connection.driver_connection.cursor(  # type: ignore[union-attr]
             retry_config=retry_config
