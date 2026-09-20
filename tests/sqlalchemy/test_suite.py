@@ -270,7 +270,10 @@ class ComponentReflectionTestExtra(_ComponentReflectionTestExtra):
         assert [column["name"] for column in inspector.get_columns(table.name)] == ["id", "added"]
 
     @sa_testing.combinations((String, None), (VARCHAR, 52), (CHAR, 52), argnames="type_,length")
-    def test_hive_string_length_reflection(self, connection, metadata, type_, length):
+    @sa_testing.combinations(False, True, argnames="information_schema")
+    def test_hive_string_length_reflection(
+        self, connection, metadata, type_, length, information_schema
+    ):
         table = Table(
             "string_length",
             metadata,
@@ -279,8 +282,17 @@ class ComponentReflectionTestExtra(_ComponentReflectionTestExtra):
             awsathena_file_format="PARQUET",
         )
         table.create(connection)
-        reflected_type = inspect(connection).get_columns(table.name)[0]["type"]
-        assert isinstance(reflected_type, type_)
+        if information_schema:
+            # Exercise the fallback with a real query without forcing an API failure.
+            dialect = connection.dialect
+            raw_connection = dialect._raw_connection(connection)
+            columns = dialect._columns_from_information_schema(
+                raw_connection, raw_connection.schema_name, table.name
+            )
+        else:
+            columns = inspect(connection).get_columns(table.name)
+        reflected_type = columns[0]["type"]
+        assert type(reflected_type) is type_
         # Generic String compiles to Hive STRING without a length constraint.
         assert reflected_type.length == length
 

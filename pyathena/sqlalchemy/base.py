@@ -429,7 +429,8 @@ class AthenaDialect(DefaultDialect):
         return [
             self._column(
                 column_name,
-                data_type,
+                # Athena exposes Hive STRING as unbounded VARCHAR in information_schema.
+                "string" if data_type == "varchar" else data_type,
                 comment if isinstance(comment, str) else None,
                 extra_info == "partition key" or None,
             )
