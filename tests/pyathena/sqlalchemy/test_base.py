@@ -644,11 +644,11 @@ class TestSQLAlchemyAthena:
         ],
         indirect=True,
     )
-    def test_throttled_metadata_requests_use_information_schema(self, engine, monkeypatch):
+    def test_throttled_columns_across_cursor_types(self, engine, monkeypatch):
         engine, conn = engine
-        # The CI matrix runs this module once per Python version against the same
-        # account, and the six engines share one ENV.schema within a process.
-        table_name = f"test_throttled_information_schema_{uuid.uuid4().hex[:8]}"
+        # The parametrized engines share one schema, so the first one creates the
+        # table and the rest reuse it.
+        table_name = "test_throttled_columns"
         Table(
             table_name,
             MetaData(schema=ENV.schema),
@@ -656,7 +656,7 @@ class TestSQLAlchemyAthena:
             Column("col_string", types.String),
             Column("dt", types.String, awsathena_partition=True),
             awsathena_location=f"{ENV.s3_staging_dir}{ENV.schema}/{table_name}/",
-        ).create(bind=conn)
+        ).create(bind=conn, checkfirst=True)
 
         raw_connection = conn.connection.driver_connection
         error = ClientError(
@@ -667,18 +667,17 @@ class TestSQLAlchemyAthena:
         def fail_metadata(**kwargs):
             raise error
 
-        # Retries are not shortened: the fallback must not wait for them.
+        # The retry policy is left alone: the fallback must not wait for it.
         monkeypatch.setattr(raw_connection.client, "get_table_metadata", fail_metadata)
 
-        # Inspect the connection the metadata client was patched on.
+        # Inspect conn, not engine, which would open an unpatched connection.
         insp = sqlalchemy.inspect(conn)
         assert insp.has_table(table_name, schema=ENV.schema)
         columns = insp.get_columns(table_name, schema=ENV.schema)
 
         # The fallback query has no ORDER BY, so this order comes from the
-        # client-side ordinal_position sort. A missing comment reaches the dialect
-        # as NaN from a CSV-backed pandas cursor and as an empty string from a
-        # CSV-backed arrow cursor; neither may become a value.
+        # client-side ordinal_position sort, and every missing-comment shape a
+        # cursor can report has to arrive as None.
         assert [column["name"] for column in columns] == ["col_int", "col_string", "dt"]
         assert [column["comment"] for column in columns] == ["identifier", None, None]
         assert [column["dialect_options"]["awsathena_partition"] for column in columns] == [
@@ -686,11 +685,12 @@ class TestSQLAlchemyAthena:
             None,
             True,
         ]
-        # information_schema reports the types Athena uses there, not the metadata
-        # API's names: STRING columns arrive as varchar.
-        assert isinstance(columns[0]["type"], types.INTEGER)
-        assert isinstance(columns[1]["type"], types.VARCHAR)
-        assert isinstance(columns[2]["type"], types.VARCHAR)
+        # information_schema names the types Athena uses there: STRING is varchar.
+        assert [type(column["type"]) for column in columns] == [
+            types.INTEGER,
+            types.VARCHAR,
+            types.VARCHAR,
+        ]
 
     def test_char_length(self, engine):
         engine, conn = engine

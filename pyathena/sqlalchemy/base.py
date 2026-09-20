@@ -489,7 +489,8 @@ class AthenaDialect(DefaultDialect):
         self, connection: Connection, table_name: str, schema: str | None = None, **kw
     ):
         metadata = self._get_table(connection, table_name, schema=schema, **kw)
-        return {"text": metadata.comment}
+        # An empty comment is no comment here too; the DDL compiler skips one.
+        return {"text": metadata.comment or None}
 
     def get_table_options(
         self, connection: Connection, table_name: str, schema: str | None = None, **kw
