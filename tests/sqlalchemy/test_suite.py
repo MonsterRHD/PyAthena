@@ -2,13 +2,15 @@ import logging
 
 import pytest
 from botocore.exceptions import ClientError
-from sqlalchemy import CHAR, VARCHAR, Integer, String, func, inspect, select
+from sqlalchemy import CHAR, VARCHAR, Integer, MetaData, String, func, inspect, select, types
+from sqlalchemy import Table as SATable
 from sqlalchemy import exc as sa_exc
 from sqlalchemy import testing as sa_testing
 from sqlalchemy.sql.elements import quoted_name
 from sqlalchemy.testing import eq_, fixtures
 from sqlalchemy.testing.schema import Column, Table
 from sqlalchemy.testing.suite import *  # noqa: F403
+from sqlalchemy.testing.suite import BinaryTest as _BinaryTest
 from sqlalchemy.testing.suite import ComponentReflectionTest as _ComponentReflectionTest
 from sqlalchemy.testing.suite import ComponentReflectionTestExtra as _ComponentReflectionTestExtra
 from sqlalchemy.testing.suite import CTETest as _CTETest
@@ -53,7 +55,6 @@ def _fail_get_table_metadata(monkeypatch, raw_connection, error, attempt=1):
     return calls
 
 
-del BinaryTest  # noqa: F821
 del CompositeKeyReflectionTest  # noqa: F821
 del DateTimeMicrosecondsTest  # noqa: F821
 del DifficultParametersTest  # noqa: F821
@@ -65,6 +66,35 @@ del TimeMicrosecondsTest  # noqa: F821
 del TimeTest  # noqa: F821
 del TimestampMicrosecondsTest  # noqa: F821
 del UuidTest  # noqa: F821
+
+
+class BinaryTest(_BinaryTest):
+    @sa_testing.combinations(types.LargeBinary, types.BINARY, types.VARBINARY, argnames="datatype")
+    @sa_testing.combinations(
+        ("empty", b""),
+        ("special", b"\x00\xff'\\%"),
+        ("all_bytes", bytes(range(256))),
+        argnames="data",
+        id_="ia",
+    )
+    def test_literal(self, literal_round_trip, datatype, data):
+        literal_round_trip(datatype, [data], [data])
+
+    def test_reflected_binary_roundtrip(self, connection):
+        binary_table = self.tables.binary_table
+        data = b"\x00\xff'\\%"
+        connection.execute(binary_table.insert(), {"id": 1, "binary_data": data})
+        reflected = SATable(
+            binary_table.name,
+            MetaData(),
+            schema=binary_table.schema,
+            autoload_with=connection,
+        )
+        assert isinstance(reflected.c.binary_data.type, types.BINARY)
+        row = connection.execute(
+            select(reflected.c.binary_data).where(reflected.c.binary_data == data)
+        ).one()
+        assert row == (data,)
 
 
 class CTETest(_CTETest):
