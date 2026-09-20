@@ -335,9 +335,10 @@ class HasTableTest(_HasTableTest):
                     column["dialect_options"]["awsathena_partition"] is None for column in columns
                 )
                 # A later listing seeds full metadata but does not replace the
-                # fallback columns; clear_cache() does.
+                # fallback columns; clear_cache() does. A new argument
+                # combination bypasses reflection.cache and reaches the dialect.
                 assert name in inspector.get_table_names()
-                assert inspector.get_columns(name) is columns
+                assert inspector.get_columns(name, schema=raw_connection.schema_name) is columns
                 inspector.clear_cache()
                 assert inspector.get_columns(name) is not columns
             else:
