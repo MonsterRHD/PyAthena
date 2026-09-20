@@ -35,8 +35,11 @@ def _metadata_error(code, message):
     return ClientError({"Error": {"Code": code, "Message": message}}, "GetTableMetadata")
 
 
-def _fail_get_table_metadata(monkeypatch, raw_connection, error):
-    """Make every GetTableMetadata call raise ``error`` without retries; return the call list."""
+def _fail_get_table_metadata(monkeypatch, raw_connection, error, attempt=1):
+    """Make every GetTableMetadata call raise ``error``; return the call list.
+
+    ``attempt`` shortens the connection's retry policy; ``None`` leaves it as is.
+    """
     calls = []
 
     def fail_metadata(**kwargs):
@@ -44,7 +47,8 @@ def _fail_get_table_metadata(monkeypatch, raw_connection, error):
         raise error
 
     monkeypatch.setattr(raw_connection.client, "get_table_metadata", fail_metadata)
-    monkeypatch.setattr(raw_connection.retry_config, "attempt", 1)
+    if attempt is not None:
+        monkeypatch.setattr(raw_connection.retry_config, "attempt", attempt)
     return calls
 
 
@@ -289,15 +293,21 @@ class LongNameBlowoutTest(_LongNameBlowoutTest):
 
 class HasTableTest(_HasTableTest):
     @sa_testing.combinations(True, False, argnames="exists")
-    def test_throttled_existence_check_uses_information_schema(
+    def test_throttled_metadata_requests_use_information_schema(
         self, connection, metadata, monkeypatch, exists
     ):
-        name = "throttled_existence" if exists else "throttled_missing"
+        name = "throttled_columns" if exists else "throttled_missing"
         if exists:
-            Table(name, metadata, Column("id", Integer)).create(connection)
+            Table(
+                name,
+                metadata,
+                Column("id", Integer, comment="identifier"),
+                Column("label", String),
+            ).create(connection)
         raw_connection = _raw_connection(connection)
+        # Retries are not shortened: the fallback must not wait for them.
         error = _metadata_error("ThrottlingException", "Rate exceeded")
-        calls = _fail_get_table_metadata(monkeypatch, raw_connection, error)
+        calls = _fail_get_table_metadata(monkeypatch, raw_connection, error, attempt=None)
         # The fallback must answer from the catalog even when result reuse is on.
         monkeypatch.setitem(raw_connection.cursor_kwargs, "result_reuse_enable", True)
         queries = []
@@ -311,18 +321,34 @@ class HasTableTest(_HasTableTest):
             inspector = inspect(connection)
             assert inspector.has_table(name) is exists
             assert inspector.has_table(name.upper(), schema=raw_connection.schema_name) is exists
+            if exists:
+                columns = inspector.get_columns(name)
+                assert [column["name"] for column in columns] == ["id", "label"]
+                assert columns[0]["comment"] == "identifier"
+                assert isinstance(columns[0]["type"], Integer)
+                assert isinstance(columns[1]["type"], String)
+                assert all(
+                    column["dialect_options"]["awsathena_partition"] is None for column in columns
+                )
+            else:
+                with pytest.raises(sa_exc.NoSuchTableError):
+                    inspector.get_columns(name)
         finally:
             raw_connection.client.meta.events.unregister(event, record_query)
-        assert len(calls) == 2
-        assert len(queries) == 2
+        # One metadata attempt, then one information_schema query per lookup.
+        # Reflected columns are reused by case and schema variants; absence is not.
+        assert len(calls) == (1 if exists else 3)
+        assert len(queries) == len(calls)
         for query in queries:
+            assert "FROM information_schema.columns" in query["QueryString"]
             assert "WHERE table_schema = " in query["QueryString"]
             assert "lower(" not in query["QueryString"]
             reuse = query["ResultReuseConfiguration"]["ResultReuseByAgeConfiguration"]
             assert reuse["Enabled"] is False
-        # Only existence falls back; reflection still reports the throttled request.
+        # Table options need the metadata API and still report the throttled request.
+        monkeypatch.setattr(raw_connection.retry_config, "attempt", 1)
         with pytest.raises(OperationalError) as caught:
-            inspector.get_columns(name)
+            inspector.get_table_options(name)
         assert caught.value.__cause__ is error
 
     @sa_testing.combinations(

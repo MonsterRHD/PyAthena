@@ -100,8 +100,9 @@ A later listing preserves metadata already fetched for a table.
 Table-metadata lookups propagate throttling and permission errors rather than reporting missing tables.
 `has_table()` propagates permission failures, including access denied by Lake Formation, instead of returning or caching `False`.
 For failed metadata requests, only recognized `EntityNotFoundException` responses establish absence; unrecognized errors are propagated rather than guessed to mean a missing table.
-When a table-metadata request is still throttled after PyAthena's retries, `has_table()` determines existence with a query on `information_schema.tables`, executed without query result reuse, and logs a warning.
-This fallback answers only existence: it does not populate the metadata cache, and column, comment, and table-option reflection still propagate the throttling error.
+Column reflection and `has_table()` make one table-metadata request; when Athena throttles it, they read `information_schema.columns` instead, executed without query result reuse, and log a warning.
+Columns reflected this way carry the type names Athena reports there, such as `varchar` for `string`, and partition columns are marked from its `extra_info` column.
+This fallback does not populate the table-metadata cache, and table comments and table options still come from the metadata API with the configured retries, so they propagate the throttling error.
 Athena applies its metadata API rate limits per account, and they are not listed in Service Quotas.
 PyAthena's API retries use exponential backoff with uniform jitter; `RetryConfig` documents the default attempt count and waits.
 PyAthena recognizes Glue error codes in Athena's `MetadataException` service-error envelope and applies `RetryConfig.exceptions` to those codes.

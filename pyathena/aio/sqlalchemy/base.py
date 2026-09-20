@@ -142,8 +142,8 @@ class AsyncAdapt_pyathena_connection(AdaptedConnection):
     def cursor_kwargs(self) -> dict[str, Any]:
         return self._connection.cursor_kwargs  # type: ignore[no-any-return]
 
-    def cursor(self) -> AsyncAdapt_pyathena_cursor:
-        raw_cursor = self._connection.cursor()
+    def cursor(self, **kwargs: Any) -> AsyncAdapt_pyathena_cursor:
+        raw_cursor = self._connection.cursor(**kwargs)
         return AsyncAdapt_pyathena_cursor(raw_cursor)
 
     def close(self) -> None:

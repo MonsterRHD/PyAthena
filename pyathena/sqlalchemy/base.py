@@ -37,7 +37,7 @@ from pyathena.sqlalchemy.types import (
     get_double_type,
 )
 from pyathena.sqlalchemy.util import _HashableDict
-from pyathena.util import THROTTLING_ERROR_CODES, _get_error_code, strtobool
+from pyathena.util import THROTTLING_ERROR_CODES, RetryConfig, _get_error_code, strtobool
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -56,6 +56,10 @@ if TYPE_CHECKING:
     from sqlalchemy.sql.schema import SchemaItem
 
 _logger = logging.getLogger(__name__)
+
+# Column reflection makes one metadata attempt and then answers from
+# information_schema, so a throttled request does not wait out the retry policy.
+_SINGLE_ATTEMPT = RetryConfig(attempt=1)
 
 
 ischema_names: dict[str, type[Any]] = {
@@ -287,37 +291,120 @@ class AthenaDialect(DefaultDialect):
         if metadata is not None:
             return metadata
         with raw_connection.driver_connection.cursor() as cursor:  # type: ignore[union-attr]
-            try:
-                # GetTableMetadata limits table names to 128 characters, while
-                # Athena SQL and ListTableMetadata support longer table names.
-                if len(table_name) > 128:
-                    lowered = name.lower()
-                    expression = re.escape(lowered)
-                    # ListTableMetadata limits its regex filter to 256 characters.
-                    # Unusual catalog names can exceed that after regex escaping.
-                    listed = cursor.list_table_metadata(
-                        schema_name=schema,
-                        expression=expression if len(expression) <= 256 else None,
-                        logging_=False,
-                    )
-                    metadata = next(
-                        (m for m in listed if m.name is not None and m.name.lower() == lowered),
-                        None,
-                    )
-                    if metadata is None:
-                        raise exc.NoSuchTableError(table_name)
-                else:
-                    metadata = cursor.get_table_metadata(
-                        table_name, schema_name=schema, logging_=False
-                    )
-            except pyathena.error.OperationalError as e:
-                if _get_error_code(e.__cause__ or e, unwrap_metadata=True) == (
-                    "EntityNotFoundException"
-                ):
-                    raise exc.NoSuchTableError(table_name) from e
-                raise
+            metadata = self._lookup_table(cursor, schema, name, table_name)
         info_cache[cache_key] = metadata
         return metadata
+
+    @staticmethod
+    def _lookup_table(cursor: Any, schema: str | None, name: str, table_name: str) -> Any:
+        """Fetch one table's metadata, raising ``NoSuchTableError`` when it is absent."""
+        try:
+            # GetTableMetadata limits table names to 128 characters, while
+            # Athena SQL and ListTableMetadata support longer table names.
+            if len(table_name) > 128:
+                lowered = name.lower()
+                expression = re.escape(lowered)
+                # ListTableMetadata limits its regex filter to 256 characters.
+                # Unusual catalog names can exceed that after regex escaping.
+                listed = cursor.list_table_metadata(
+                    schema_name=schema,
+                    expression=expression if len(expression) <= 256 else None,
+                    logging_=False,
+                )
+                metadata = next(
+                    (m for m in listed if m.name is not None and m.name.lower() == lowered),
+                    None,
+                )
+                if metadata is None:
+                    raise exc.NoSuchTableError(table_name)
+                return metadata
+            return cursor.get_table_metadata(table_name, schema_name=schema, logging_=False)
+        except pyathena.error.OperationalError as e:
+            if _get_error_code(e.__cause__ or e, unwrap_metadata=True) == (
+                "EntityNotFoundException"
+            ):
+                raise exc.NoSuchTableError(table_name) from e
+            raise
+
+    def _get_columns(self, connection, table_name: str, schema: str | None = None, **kw):
+        raw_connection = self._raw_connection(connection)
+        catalog = self._cursor_option(raw_connection, "catalog_name")
+        schema = schema if schema else raw_connection.schema_name  # type: ignore[union-attr]
+        name = self._fold_table_name(catalog, str(table_name))
+        info_cache = kw.get("info_cache")
+        if info_cache is None:
+            info_cache = {}
+        metadata_key = ("pyathena_table_metadata", catalog, schema, name)
+        metadata = info_cache.get(metadata_key)
+        if metadata is not None:
+            return self._columns_from_metadata(metadata)
+        columns_key = ("pyathena_information_schema_columns", catalog, schema, name)
+        columns = info_cache.get(columns_key)
+        if columns is not None:
+            return columns
+        # A throttled metadata request switches to information_schema at once
+        # instead of waiting out the retry policy; the query answers existence
+        # and columns, while table comments and options still need the API.
+        with raw_connection.driver_connection.cursor(  # type: ignore[union-attr]
+            retry_config=_SINGLE_ATTEMPT
+        ) as cursor:
+            try:
+                metadata = self._lookup_table(cursor, schema, name, table_name)
+            except pyathena.error.OperationalError as e:
+                if (
+                    _get_error_code(e.__cause__ or e, unwrap_metadata=True)
+                    not in THROTTLING_ERROR_CODES
+                ):
+                    raise
+                _logger.warning(
+                    f"Table metadata request for {table_name} was throttled; "
+                    "reflecting columns from information_schema."
+                )
+                columns = self._columns_from_information_schema(raw_connection, schema, name)
+                if not columns:
+                    raise exc.NoSuchTableError(table_name) from e
+                info_cache[columns_key] = columns
+                return columns
+        info_cache[metadata_key] = metadata
+        return self._columns_from_metadata(metadata)
+
+    def _column(self, name: str | None, type_: str, comment: str | None, partition: bool | None):
+        return {
+            "name": name,
+            "type": self._get_column_type(type_),
+            "nullable": True,
+            "default": None,
+            "autoincrement": False,
+            "comment": comment,
+            "dialect_options": {"awsathena_partition": partition},
+        }
+
+    def _columns_from_metadata(self, metadata: Any):
+        return [self._column(c.name, c.type, c.comment, None) for c in metadata.columns] + [
+            self._column(c.name, c.type, c.comment, True) for c in metadata.partition_keys
+        ]
+
+    def _columns_from_information_schema(
+        self, raw_connection: PoolProxiedConnection, schema: str | None, table_name: str
+    ):
+        # Athena resolves identifiers case-insensitively and information_schema
+        # reports lowercase names; plain equality keeps the filter pushed down.
+        # The answer must reflect the catalog now, so query result reuse is off.
+        schema = str(schema).lower().replace("'", "''")
+        table_name = table_name.lower().replace("'", "''")
+        with raw_connection.driver_connection.cursor() as cursor:  # type: ignore[union-attr]
+            cursor.execute(
+                "SELECT column_name, data_type, comment, extra_info "
+                "FROM information_schema.columns "
+                f"WHERE table_schema = '{schema}' AND table_name = '{table_name}' "
+                "ORDER BY ordinal_position",
+                result_reuse_enable=False,
+            )
+            rows = cursor.fetchall()
+        return [
+            self._column(column_name, data_type, comment, extra_info == "partition key" or None)
+            for column_name, data_type, comment, extra_info in rows
+        ]
 
     def _get_tables(self, connection, schema: str | None = None, **kw):
         raw_connection = self._raw_connection(connection)
@@ -385,44 +472,10 @@ class AthenaDialect(DefaultDialect):
 
     @reflection.cache
     def has_table(self, connection: Connection, table_name: str, schema: str | None = None, **kw):
-        raw_connection = self._raw_connection(connection)
         try:
-            metadata = self._get_table(connection, table_name, schema=schema, **kw)
-            return bool(metadata.columns or metadata.partition_keys)
+            return bool(self.get_columns(connection, table_name, schema, **kw))
         except exc.NoSuchTableError:
             return False
-        except pyathena.error.OperationalError as e:
-            if (
-                _get_error_code(e.__cause__ or e, unwrap_metadata=True)
-                not in THROTTLING_ERROR_CODES
-            ):
-                raise
-            # The metadata API is still throttled after PyAthena's retries.
-            # Existence can be answered by a query; column, comment and option
-            # reflection cannot, so only this check falls back.
-            _logger.warning(
-                f"Table metadata request for {table_name} was throttled; "
-                "checking existence with information_schema."
-            )
-            schema = schema if schema else raw_connection.schema_name  # type: ignore[union-attr]
-            return self._has_table_information_schema(raw_connection, str(table_name), str(schema))
-
-    @staticmethod
-    def _has_table_information_schema(
-        raw_connection: PoolProxiedConnection, table_name: str, schema: str
-    ) -> bool:
-        # Athena resolves identifiers case-insensitively and information_schema
-        # reports lowercase names; plain equality keeps the filter pushed down.
-        # The answer must reflect the catalog now, so query result reuse is off.
-        schema = schema.lower().replace("'", "''")
-        table_name = table_name.lower().replace("'", "''")
-        with raw_connection.driver_connection.cursor() as cursor:  # type: ignore[union-attr]
-            cursor.execute(
-                "SELECT table_name FROM information_schema.tables "
-                f"WHERE table_schema = '{schema}' AND table_name = '{table_name}'",
-                result_reuse_enable=False,
-            )
-            return cursor.fetchone() is not None
 
     @reflection.cache
     def get_view_definition(
@@ -440,32 +493,7 @@ class AthenaDialect(DefaultDialect):
 
     @reflection.cache
     def get_columns(self, connection: Connection, table_name: str, schema: str | None = None, **kw):
-        metadata = self._get_table(connection, table_name, schema=schema, **kw)
-        columns = [
-            {
-                "name": c.name,
-                "type": self._get_column_type(c.type),
-                "nullable": True,
-                "default": None,
-                "autoincrement": False,
-                "comment": c.comment,
-                "dialect_options": {"awsathena_partition": None},
-            }
-            for c in metadata.columns
-        ]
-        columns += [
-            {
-                "name": c.name,
-                "type": self._get_column_type(c.type),
-                "nullable": True,
-                "default": None,
-                "autoincrement": False,
-                "comment": c.comment,
-                "dialect_options": {"awsathena_partition": True},
-            }
-            for c in metadata.partition_keys
-        ]
-        return columns
+        return self._get_columns(connection, table_name, schema=schema, **kw)
 
     def _get_column_type(self, type_: str):
         match = self._pattern_column_type.match(type_)

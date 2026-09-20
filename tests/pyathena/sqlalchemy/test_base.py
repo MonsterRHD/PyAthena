@@ -50,6 +50,41 @@ def unique_s3tables_table_name(base: str) -> str:
 
 
 class TestAthenaDialect:
+    def test_columns_from_information_schema(self):
+        rows = [
+            ("id", "integer", "identifier", None),
+            ("payload", "row(a integer, b array(varchar))", None, None),
+            ("dt", "varchar", None, "partition key"),
+        ]
+        executed = []
+
+        def execute(operation, **kwargs):
+            executed.append((operation, kwargs))
+
+        cursor = SimpleNamespace(execute=execute, fetchall=lambda: rows)
+        raw_connection = SimpleNamespace(
+            driver_connection=SimpleNamespace(cursor=lambda: contextlib.nullcontext(cursor))
+        )
+
+        columns = AthenaDialect()._columns_from_information_schema(
+            raw_connection, "My_Schema", "O'Neil"
+        )
+
+        assert [column["name"] for column in columns] == ["id", "payload", "dt"]
+        assert isinstance(columns[0]["type"], types.INTEGER)
+        assert columns[0]["comment"] == "identifier"
+        assert isinstance(columns[1]["type"], AthenaStruct)
+        assert isinstance(columns[2]["type"], types.VARCHAR)
+        assert [column["dialect_options"]["awsathena_partition"] for column in columns] == [
+            None,
+            None,
+            True,
+        ]
+        ((operation, kwargs),) = executed
+        assert "WHERE table_schema = 'my_schema' AND table_name = 'o''neil'" in operation
+        assert "ORDER BY ordinal_position" in operation
+        assert kwargs == {"result_reuse_enable": False}
+
     def test_get_table_matches_long_names_case_insensitively(self):
         # GetTableMetadata rejects names over 128 characters, so the lookup lists
         # with a lowercase filter and matches the catalog's own casing.
