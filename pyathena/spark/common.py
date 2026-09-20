@@ -28,6 +28,13 @@ _TERMINAL_CALCULATION_STATES = frozenset(
         AthenaCalculationExecutionStatus.STATE_CANCELED,
     }
 )
+_UNUSABLE_SESSION_STATES = frozenset(
+    {
+        AthenaSessionStatus.STATE_TERMINATED,
+        AthenaSessionStatus.STATE_DEGRADED,
+        AthenaSessionStatus.STATE_FAILED,
+    }
+)
 
 
 class SparkBaseCursor(BaseCursor, metaclass=ABCMeta):
@@ -95,10 +102,31 @@ class SparkBaseCursor(BaseCursor, metaclass=ABCMeta):
         self._closing = False
         self._closed = False
 
+        # Create the S3 client before acquiring any session ownership so a
+        # construction failure cannot leak an ownership count.
+        self._client = self.connection.session.client(
+            "s3",
+            region_name=self.connection.region_name,
+            config=self.connection.config,
+            **self.connection._client_kwargs,
+        )
+
         if session_id:
-            if self.connection._spark_join_session(session_id):
-                # Another cursor of this connection created the session;
-                # this cursor shares its ownership.
+            acquired = self.connection._spark_acquire_session(session_id)
+            if acquired == "terminating":
+                raise OperationalError(
+                    f"Session: {session_id} is being terminated by another cursor "
+                    f"of this connection."
+                )
+            if acquired == "joined":
+                # Another cursor of this connection created the session; this
+                # cursor shares its ownership. Verify liveness because the
+                # session may have been terminated (e.g. idle timeout).
+                try:
+                    self._assert_session_usable(session_id)
+                except Exception:
+                    self.connection._spark_leave_session(session_id)
+                    raise
                 self._session_id = session_id
                 self._owns_session = True
             elif self._exists_session(session_id):
@@ -114,13 +142,6 @@ class SparkBaseCursor(BaseCursor, metaclass=ABCMeta):
 
         self._calculation_id: str | None = None
         self._calculation_execution: AthenaCalculationExecution | None = None
-
-        self._client = self.connection.session.client(
-            "s3",
-            region_name=self.connection.region_name,
-            config=self.connection.config,
-            **self.connection._client_kwargs,
-        )
         self.connection._spark_register_cursor(self)
 
     @property
@@ -154,6 +175,21 @@ class SparkBaseCursor(BaseCursor, metaclass=ABCMeta):
     def _register_calculation(self, calculation_id: str) -> None:
         with self._lock:
             self._calculations.setdefault(calculation_id, None)
+
+    def _register_started_calculation(self, calculation_id: str) -> bool:
+        """Register a just-started calculation and report whether close ran.
+
+        ``execute()`` calls this immediately after the start API returns. If
+        close already converged while the start request was in flight, the
+        caller must stop the newly started calculation itself because the
+        close could not have observed it.
+
+        Returns:
+            True if the cursor has already fully closed.
+        """
+        with self._lock:
+            self._calculations.setdefault(calculation_id, None)
+            return self._closed
 
     def _record_terminal_calculation(
         self, calculation_id: str, execution: AthenaCalculationExecution
@@ -207,13 +243,15 @@ class SparkBaseCursor(BaseCursor, metaclass=ABCMeta):
             session_status = self._get_session_status(session_id)
             if session_status.state in [AthenaSessionStatus.STATE_IDLE]:
                 break
-            if session_status.state in [
-                AthenaSessionStatus.STATE_TERMINATED,
-                AthenaSessionStatus.STATE_DEGRADED,
-                AthenaSessionStatus.STATE_FAILED,
-            ]:
+            if session_status.state in _UNUSABLE_SESSION_STATES:
                 raise OperationalError(session_status.state_change_reason)
             time.sleep(self._poll_interval)
+
+    def _assert_session_usable(self, session_id: str) -> None:
+        """Raise unless the session is in a state that accepts calculations."""
+        session_status = self._get_session_status(session_id)
+        if session_status.state in _UNUSABLE_SESSION_STATES:
+            raise OperationalError(f"Session: {session_id} is in state {session_status.state}.")
 
     def _exists_session(self, session_id: str) -> bool:
         request = {"SessionId": session_id}
@@ -371,18 +409,35 @@ class SparkBaseCursor(BaseCursor, metaclass=ABCMeta):
                 errors.append(e)
         return errors
 
-    def _release_owned_session(self) -> Exception | None:
+    def _stop_after_missed_close(self, calculation_id: str) -> None:
+        """Best-effort stop for a start that returned after close converged.
+
+        The cursor is already unregistered, so failures are only logged;
+        for a client-owned session the terminating/terminated session
+        force-stops the calculation server-side anyway.
+        """
+        try:
+            self._stop_calculation(calculation_id)
+        except Exception:
+            _logger.exception(
+                "Failed to stop calculation %s that started while the cursor was closing.",
+                calculation_id,
+            )
+
+    def _release_owned_session(self) -> BaseException | None:
         if not self._owns_session:
             return None
         if not self.connection._spark_release_session(self._session_id):
             return None
         try:
             self._terminate_session()
-        except Exception as e:
-            # Keep the ownership claim so a later close() retries the
-            # termination instead of pretending the session was cleaned up.
+        except BaseException as e:
+            # Keep the ownership claim (also on KeyboardInterrupt / task
+            # cancellation) so a later close() retries instead of losing the
+            # session while termination may still be in flight.
             self.connection._spark_rearm_session(self._session_id)
             return e
+        self.connection._spark_mark_session_terminated(self._session_id)
         return None
 
     def close(self) -> None:
@@ -393,22 +448,28 @@ class SparkBaseCursor(BaseCursor, metaclass=ABCMeta):
         the method is idempotent after success and retryable after a
         failure, in which case it raises
         :class:`~pyathena.error.OperationalError` describing the unfinished
-        remote cleanup.
+        remote cleanup. Session ownership is only released after this
+        cursor's calculations are stopped, so a failed stop can never
+        release (and terminate) a session that another owner still counts.
         """
         with self._close_lock:
             if self._closed:
                 return
             self._closing = True
             errors = self._stop_active_calculations()
+            if errors:
+                raise OperationalError(
+                    f"Failed to stop active calculations of the Spark cursor for "
+                    f"session {self._session_id}. Retrying close() reattempts the "
+                    f"unfinished cleanup."
+                ) from errors[0]
             session_error = self._release_owned_session()
             if session_error is not None:
-                errors.append(session_error)
-            if errors:
                 raise OperationalError(
                     f"Failed to fully close Spark cursor for session "
                     f"{self._session_id}. Retrying close() reattempts the unfinished "
                     f"cleanup; the session may still be running."
-                ) from errors[0]
+                ) from session_error
             self._closed = True
             self.connection._spark_unregister_cursor(self)
 

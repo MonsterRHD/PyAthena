@@ -63,6 +63,7 @@ def _make_cursor(
     with (
         patch.object(cursor_class, "_start_session", return_value=owned_session_id),
         patch.object(cursor_class, "_exists_session", return_value=True),
+        patch.object(cursor_class, "_assert_session_usable"),
     ):
         return conn.cursor(
             cursor_class,
@@ -281,6 +282,86 @@ class TestSparkCursorOwnership:
         assert cursor._connection.client.terminate_session.call_count == 1
         assert conn._spark_session_owners == {}
 
+    def test_failed_calculation_stop_never_releases_other_owner(self, conn):
+        first = _make_cursor(conn, owned_session_id="shared")
+        second = _make_cursor(conn, session_id="shared")
+        stop_mock = MagicMock()
+        terminate_mock = MagicMock()
+        conn.client.stop_calculation_execution = stop_mock
+        conn.client.terminate_session = terminate_mock
+        first._get_calculation_execution_status = MagicMock(
+            side_effect=_client_error("InternalServerException")
+        )
+        first._register_calculation("calc-a")
+
+        with pytest.raises(OperationalError):
+            first.close()
+        with pytest.raises(OperationalError):
+            first.close()
+        # Both failed attempts kept the ownership claims intact.
+        assert conn._spark_session_owners["shared"] == 2
+
+        first._get_calculation_execution_status = MagicMock(
+            side_effect=[_status(RUNNING), _status(CANCELED)]
+        )
+        first._get_calculation_execution = MagicMock(return_value=_status(CANCELED))
+        first.close()
+        assert conn._spark_session_owners["shared"] == 1
+        terminate_mock.assert_not_called()
+
+        second.close()
+        stop_mock.assert_called_once_with(CalculationExecutionId="calc-a")
+        terminate_mock.assert_called_once_with(SessionId="shared")
+
+    def test_start_returning_after_close_is_stopped_and_not_published(self, conn):
+        cursor = _make_cursor(conn, session_id="external")
+        _stub_calculation(cursor, [_status(RUNNING), _status(CANCELED)])
+
+        def start_then_close(**kwargs) -> str:
+            cursor.close()
+            return "late-calc"
+
+        cursor._calculate = MagicMock(side_effect=start_then_close)
+
+        with pytest.raises(ProgrammingError):
+            cursor.execute("print('late')")
+        cursor._connection.client.stop_calculation_execution.assert_called_once_with(
+            CalculationExecutionId="late-calc"
+        )
+        cursor._connection.client.terminate_session.assert_not_called()
+        assert cursor.is_closed
+
+    def test_session_being_terminated_cannot_be_borrowed(self, conn):
+        _make_cursor(conn, owned_session_id="shared")
+        # Simulate the last owner's release phase (terminate in flight).
+        assert conn._spark_release_session("shared") is True
+        try:
+            with pytest.raises(OperationalError, match="being terminated"):
+                _make_cursor(conn, session_id="shared")
+            assert conn._spark_terminating_sessions == {"shared"}
+        finally:
+            conn._spark_mark_session_terminated("shared")
+
+    def test_joining_dead_session_raises_without_touching_ownership(self, conn):
+        _make_cursor(conn, owned_session_id="shared")
+        with (
+            patch.object(SparkCursor, "_start_session", return_value="shared"),
+            patch.object(SparkCursor, "_exists_session", return_value=True),
+            patch.object(
+                SparkCursor,
+                "_assert_session_usable",
+                side_effect=OperationalError("TERMINATED"),
+            ),
+            pytest.raises(OperationalError, match="TERMINATED"),
+        ):
+            conn.cursor(
+                SparkCursor,
+                session_id="shared",
+                poll_interval=0,
+                kill_on_interrupt=False,
+            )
+        assert conn._spark_session_owners["shared"] == 1
+
 
 # --- connection close ---
 
@@ -408,6 +489,23 @@ class TestAsyncSparkCursorOwnership:
             cursor.get_std_out(_status(COMPLETED))
         with pytest.raises(ProgrammingError):
             cursor.poll("calc-1")
+
+    def test_start_returning_after_close_is_stopped_and_not_published(self, conn):
+        cursor = _make_cursor(conn, AsyncSparkCursor, session_id="external")
+        _stub_calculation(cursor, [_status(RUNNING), _status(CANCELED)])
+
+        def start_then_close(**kwargs) -> str:
+            cursor.close(wait=True)
+            return "late-calc"
+
+        cursor._calculate = MagicMock(side_effect=start_then_close)
+
+        with pytest.raises(ProgrammingError):
+            cursor.execute("print('late')")
+        cursor._connection.client.stop_calculation_execution.assert_called_once_with(
+            CalculationExecutionId="late-calc"
+        )
+        cursor._connection.client.terminate_session.assert_not_called()
 
 
 # --- native asyncio AioSparkCursor ---
@@ -537,3 +635,48 @@ class TestAioSparkCursorOwnership:
 
         assert terminate_mock.call_count == 1
         assert aio_conn._spark_session_owners == {}
+
+    async def test_start_returning_after_close_is_stopped_and_not_published(
+        self, aio_conn, aio_cursor
+    ):
+        cursor = await aio_cursor(session_id="external")
+
+        async def status_side(calculation_id):
+            return _status(RUNNING if not stop_mock.called else CANCELED)
+
+        async def start_then_close(**kwargs) -> str:
+            await cursor.close()
+            return "late-calc"
+
+        stop_mock = MagicMock()
+        terminate_mock = MagicMock()
+        cursor._connection.client.stop_calculation_execution = stop_mock
+        cursor._connection.client.terminate_session = terminate_mock
+        cursor._get_calculation_execution_status = MagicMock(side_effect=status_side)
+        cursor._get_calculation_execution = self._async_mock(_status(CANCELED))
+        cursor._calculate = MagicMock(side_effect=start_then_close)
+
+        with pytest.raises(ProgrammingError):
+            await cursor.execute("print('late')")
+        stop_mock.assert_called_once_with(CalculationExecutionId="late-calc")
+        terminate_mock.assert_not_called()
+
+    async def test_cancellation_during_terminate_rearms_ownership(self, aio_conn, aio_cursor):
+        cursor = await aio_cursor(owned_session_id="owned-1")
+        terminate_started = asyncio.Event()
+
+        async def hang_terminate():
+            terminate_started.set()
+            await asyncio.Event().wait()  # cancelled instead of returning
+
+        cursor._terminate_session = hang_terminate
+
+        task = asyncio.create_task(cursor.close())
+        await terminate_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert cursor.is_closed is False
+        assert aio_conn._spark_session_owners["owned-1"] == 1
+        assert cursor in aio_conn._spark_open_cursors()

@@ -4,6 +4,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from multiprocessing import cpu_count
 from typing import TYPE_CHECKING, Any, cast
 
+from pyathena.error import ProgrammingError
 from pyathena.model import AthenaCalculationExecution
 from pyathena.spark.common import SparkBaseCursor
 
@@ -167,8 +168,12 @@ class AsyncSparkCursor(SparkBaseCursor):
             client_request_token=client_request_token,
         )
         # Register before the future starts so close stops the calculation
-        # even if execute's caller never inspects the future.
-        self._register_calculation(calculation_id)
+        # even if execute's caller never inspects the future. If close already
+        # converged while the start request was in flight, stop the new
+        # calculation instead of handing out a future nobody will clean up.
+        if self._register_started_calculation(calculation_id):
+            self._stop_after_missed_close(calculation_id)
+            raise ProgrammingError("Cannot publish a calculation started while closing.")
         return calculation_id, self._submit(self._poll, calculation_id)
 
     def cancel(self, query_id: str) -> "Future[None]":

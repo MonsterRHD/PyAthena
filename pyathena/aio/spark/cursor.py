@@ -224,6 +224,16 @@ class AioSparkCursor(SparkBaseCursor, WithCalculationExecution):
         self._record_terminal_calculation(calculation_id, execution)
         return execution
 
+    async def _astop_after_missed_close(self, calculation_id: str) -> None:
+        """Async counterpart of the best-effort stop for a late-start calc."""
+        try:
+            await self._stop_calculation(calculation_id)
+        except Exception:
+            _logger.exception(
+                "Failed to stop calculation %s that started while the cursor was closing.",
+                calculation_id,
+            )
+
     async def _terminate_session(self) -> None:  # type: ignore[override]
         """Terminate the session; idempotent for an already terminated one."""
         request: dict[str, Any] = {"SessionId": self._session_id}
@@ -322,12 +332,16 @@ class AioSparkCursor(SparkBaseCursor, WithCalculationExecution):
             client_request_token=client_request_token,
         )
         # Register before polling so close stops a calculation whose poll
-        # fails or is cancelled.
-        self._register_calculation(self._calculation_id)
+        # fails or is cancelled. If close converged while the start request
+        # was in flight, stop the new calculation instead of polling it.
+        if self._register_started_calculation(self._calculation_id):
+            await self._astop_after_missed_close(self._calculation_id)
+            raise ProgrammingError("Cannot publish a calculation started while closing.")
         calculation_execution = cast(
             AthenaCalculationExecution, await self._poll(self._calculation_id)
         )
-        # A close that raced with the terminal poll owns publication now.
+        # No await between this gate and the assignment, so close cannot
+        # begin in between on the same event loop.
         self._raise_if_closing()
         self._calculation_execution = calculation_execution
         if self._calculation_execution.state != AthenaCalculationExecutionStatus.STATE_COMPLETED:
@@ -366,19 +380,21 @@ class AioSparkCursor(SparkBaseCursor, WithCalculationExecution):
                 except Exception as e:  # noqa: PERF203
                     _logger.exception("Failed to stop calculation %s.", calculation_id)
                     errors.append(e)
+            if errors:
+                raise OperationalError(
+                    f"Failed to stop active calculations of the Spark cursor for "
+                    f"session {self._session_id}. Retrying close() reattempts the "
+                    f"unfinished cleanup."
+                ) from errors[0]
             if self._owns_session and self.connection._spark_release_session(self._session_id):
                 try:
                     await self._terminate_session()
-                except Exception as e:
-                    # Keep the ownership claim so a later close() can retry.
+                except BaseException:
+                    # Rearm even on task cancellation so the interrupted
+                    # termination is retried instead of reported as closed.
                     self.connection._spark_rearm_session(self._session_id)
-                    errors.append(e)
-            if errors:
-                raise OperationalError(
-                    f"Failed to fully close Spark cursor for session "
-                    f"{self._session_id}. Retrying close() reattempts the unfinished "
-                    f"cleanup; the session may still be running."
-                ) from errors[0]
+                    raise
+                self.connection._spark_mark_session_terminated(self._session_id)
             self._closed = True
             self.connection._spark_unregister_cursor(self)
 

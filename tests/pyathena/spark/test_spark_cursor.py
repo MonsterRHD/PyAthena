@@ -151,9 +151,18 @@ class TestSparkCursor:
 
     def test_borrowed_session_survives_borrower_close(self):
         from pyathena.connection import Connection
+        from pyathena.spark.cursor import SparkCursor
 
-        owner_conn = Connection(work_group=ENV.spark_work_group, schema_name=ENV.schema)
-        borrower_conn = Connection(work_group=ENV.spark_work_group, schema_name=ENV.schema)
+        owner_conn = Connection(
+            work_group=ENV.spark_work_group,
+            schema_name=ENV.schema,
+            cursor_class=SparkCursor,
+        )
+        borrower_conn = Connection(
+            work_group=ENV.spark_work_group,
+            schema_name=ENV.schema,
+            cursor_class=SparkCursor,
+        )
         try:
             with owner_conn.cursor() as owner:
                 owner.execute("print('owner')")

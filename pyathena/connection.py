@@ -349,6 +349,9 @@ class Connection(Generic[ConnectionCursor]):
         self._spark_lock = threading.Lock()
         self._spark_cursors: set[Any] = set()
         self._spark_session_owners: dict[str, int] = {}
+        # Sessions whose last owner is currently terminating them: a new
+        # cursor must neither join nor borrow them while termination runs.
+        self._spark_terminating_sessions: set[str] = set()
 
     def _assume_role(
         self,
@@ -598,25 +601,37 @@ class Connection(Generic[ConnectionCursor]):
         with self._spark_lock:
             self._spark_session_owners[session_id] = 1
 
-    def _spark_join_session(self, session_id: str) -> bool:
-        """Join ownership of a session created through this connection.
+    def _spark_acquire_session(self, session_id: str) -> str:
+        """Acquire access to a session while constructing a cursor.
 
         Returns:
-            True if the session is client-owned and this cursor joined it,
-            False if the session is unknown to the connection (borrowed).
+            "joined" when the session was created through this connection
+            and ownership was incremented, "terminating" while its last owner
+            is terminating it, or "unknown" when it is external (borrowed
+            subject to an existence check).
         """
         with self._spark_lock:
+            if session_id in self._spark_terminating_sessions:
+                return "terminating"
             if session_id in self._spark_session_owners:
                 self._spark_session_owners[session_id] += 1
-                return True
-            return False
+                return "joined"
+            return "unknown"
+
+    def _spark_leave_session(self, session_id: str) -> None:
+        """Roll back an ownership increment from an aborted cursor creation."""
+        with self._spark_lock:
+            owners = self._spark_session_owners.get(session_id, 0)
+            if owners > 0:
+                self._spark_session_owners[session_id] = owners - 1
 
     def _spark_release_session(self, session_id: str) -> bool:
         """Release one ownership of a client-owned session.
 
         Returns:
             True if the caller was the last owner and must terminate the
-            session; the registration is removed atomically in that case.
+            session; the registration is removed and the session is marked
+            terminating atomically so concurrent cursors cannot borrow it.
         """
         with self._spark_lock:
             owners = self._spark_session_owners.get(session_id)
@@ -624,16 +639,23 @@ class Connection(Generic[ConnectionCursor]):
                 return False
             if owners <= 1:
                 self._spark_session_owners.pop(session_id, None)
+                self._spark_terminating_sessions.add(session_id)
                 return True
             self._spark_session_owners[session_id] = owners - 1
             return False
 
     def _spark_rearm_session(self, session_id: str) -> None:
-        """Restore ownership so a failed termination can be retried."""
+        """Restore ownership after termination failed or was interrupted."""
         with self._spark_lock:
+            self._spark_terminating_sessions.discard(session_id)
             self._spark_session_owners[session_id] = (
                 self._spark_session_owners.get(session_id, 0) + 1
             )
+
+    def _spark_mark_session_terminated(self, session_id: str) -> None:
+        """Clear the terminating marker after termination completed."""
+        with self._spark_lock:
+            self._spark_terminating_sessions.discard(session_id)
 
     def _close_spark_cursors(self) -> None:
         """Close all open Spark cursors using the cursor close rules.
