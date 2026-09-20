@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import sqlalchemy
+from botocore.exceptions import ClientError
 from sqlalchemy import create_engine, func, literal_column, select, text, types
 from sqlalchemy.exc import NoSuchTableError
 from sqlalchemy.sql import expression, type_coerce
@@ -18,6 +19,7 @@ from sqlalchemy.sql.ddl import CreateTable
 from sqlalchemy.sql.schema import Column, MetaData, Table
 from sqlalchemy.sql.selectable import TextualSelect
 
+from pyathena.error import OperationalError
 from pyathena.sqlalchemy.base import AthenaDialect
 from pyathena.sqlalchemy.types import (
     TINYINT,
@@ -89,16 +91,63 @@ class TestAthenaDialect:
 
     def test_without_throttling_retries_keeps_other_codes(self):
         policy = RetryConfig(
-            exceptions=("ThrottlingException", "InternalServerException"),
+            exceptions=(
+                "ThrottlingException",
+                "TooManyRequestsException",
+                "MetadataException",
+                "InternalServerException",
+            ),
             attempt=10,
             multiplier=2,
             max_delay=30,
             exponential_base=3,
         )
         derived = AthenaDialect._without_throttling_retries(policy)
+        # MetadataException carries wrapped throttling, so it is dropped as well.
         assert derived.exceptions == ("InternalServerException",)
         assert (derived.attempt, derived.multiplier, derived.max_delay) == (10, 2, 30)
         assert derived.exponential_base == 3
+
+    def test_cursor_schema_applies_to_lookup_fallback_and_cache(self):
+        # A schema given in cursor_kwargs is the one the cursor queries, so the
+        # metadata request, the information_schema fallback and the cache keys
+        # must all use it when the connection has no schema of its own.
+        error = ClientError(
+            {"Error": {"Code": "ThrottlingException", "Message": "Rate exceeded"}},
+            "GetTableMetadata",
+        )
+        requests = []
+        executed = []
+
+        def get_table_metadata(table_name, **kwargs):
+            requests.append(kwargs)
+            raise OperationalError(*error.args) from error
+
+        cursor = SimpleNamespace(
+            get_table_metadata=get_table_metadata,
+            execute=lambda operation, **kwargs: executed.append(operation),
+            fetchall=lambda: [("1", "id", "integer", None, None)],
+        )
+        raw_connection = SimpleNamespace(
+            cursor_kwargs={"schema_name": "analytics"},
+            catalog_name="awsdatacatalog",
+            schema_name=None,
+            retry_config=RetryConfig(),
+            driver_connection=SimpleNamespace(
+                cursor=lambda **kwargs: contextlib.nullcontext(cursor)
+            ),
+        )
+        connection = SimpleNamespace(connection=raw_connection)
+        info_cache = {}
+
+        columns = AthenaDialect()._get_columns(connection, "Events", info_cache=info_cache)
+
+        assert [column["name"] for column in columns] == ["id"]
+        assert requests == [{"schema_name": "analytics", "logging_": False}]
+        assert "WHERE table_schema = 'analytics' AND table_name = 'events'" in executed[0]
+        assert list(info_cache) == [
+            ("pyathena_information_schema_columns", "awsdatacatalog", "analytics", "events")
+        ]
 
     def test_get_table_matches_long_names_case_insensitively(self):
         # GetTableMetadata rejects names over 128 characters, so the lookup lists

@@ -275,7 +275,7 @@ class AthenaDialect(DefaultDialect):
     def _get_table(self, connection, table_name: str, schema: str | None = None, **kw):
         raw_connection = self._raw_connection(connection)
         catalog = self._cursor_option(raw_connection, "catalog_name")
-        schema = schema if schema else raw_connection.schema_name  # type: ignore[union-attr]
+        schema = schema if schema else self._cursor_option(raw_connection, "schema_name")
         name = self._fold_table_name(catalog, str(table_name))
         # Key by the metadata request, not the reflection method's arguments.
         # Listings and individual lookups share positive results in this Inspector.
@@ -325,7 +325,7 @@ class AthenaDialect(DefaultDialect):
     def _get_columns(self, connection, table_name: str, schema: str | None = None, **kw):
         raw_connection = self._raw_connection(connection)
         catalog = self._cursor_option(raw_connection, "catalog_name")
-        schema = schema if schema else raw_connection.schema_name  # type: ignore[union-attr]
+        schema = schema if schema else self._cursor_option(raw_connection, "schema_name")
         name = self._fold_table_name(catalog, str(table_name))
         info_cache = kw.get("info_cache")
         if info_cache is None:
@@ -374,8 +374,14 @@ class AthenaDialect(DefaultDialect):
 
     @staticmethod
     def _without_throttling_retries(retry_config: RetryConfig) -> RetryConfig:
+        """Copy a policy without the codes that carry throttling.
+
+        Athena wraps Glue throttling in ``MetadataException``, so that code is
+        dropped as well; specific wrapped codes stay retryable.
+        """
+        excluded = (*THROTTLING_ERROR_CODES, "MetadataException")
         return RetryConfig(
-            exceptions=[c for c in retry_config.exceptions if c not in THROTTLING_ERROR_CODES],
+            exceptions=[c for c in retry_config.exceptions if c not in excluded],
             attempt=retry_config.attempt,
             multiplier=retry_config.multiplier,
             max_delay=retry_config.max_delay,
@@ -431,7 +437,7 @@ class AthenaDialect(DefaultDialect):
     def _get_tables(self, connection, schema: str | None = None, **kw):
         raw_connection = self._raw_connection(connection)
         catalog = self._cursor_option(raw_connection, "catalog_name")
-        schema = schema if schema else raw_connection.schema_name  # type: ignore[union-attr]
+        schema = schema if schema else self._cursor_option(raw_connection, "schema_name")
         info_cache = kw.get("info_cache")
         if info_cache is None:
             info_cache = {}
@@ -504,7 +510,7 @@ class AthenaDialect(DefaultDialect):
         self, connection: Connection, view_name: str, schema: str | None = None, **kw
     ):
         raw_connection = self._raw_connection(connection)
-        schema = schema if schema else raw_connection.schema_name  # type: ignore[union-attr]
+        schema = schema if schema else self._cursor_option(raw_connection, "schema_name")
         query = f"""SHOW CREATE VIEW "{schema}"."{view_name}";"""
         try:
             res = connection.scalars(text(query))

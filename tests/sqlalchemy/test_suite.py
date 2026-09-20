@@ -334,6 +334,12 @@ class HasTableTest(_HasTableTest):
                 assert all(
                     column["dialect_options"]["awsathena_partition"] is None for column in columns
                 )
+                # A later listing seeds full metadata but does not replace the
+                # fallback columns; clear_cache() does.
+                assert name in inspector.get_table_names()
+                assert inspector.get_columns(name) is columns
+                inspector.clear_cache()
+                assert inspector.get_columns(name) is not columns
             else:
                 with pytest.raises(sa_exc.NoSuchTableError):
                     inspector.get_columns(name)
@@ -341,7 +347,7 @@ class HasTableTest(_HasTableTest):
             raw_connection.client.meta.events.unregister(event, record_query)
         # One metadata attempt, then one information_schema query per lookup.
         # Reflected columns are reused by case and schema variants; absence is not.
-        assert len(calls) == (1 if exists else 3)
+        assert len(calls) == (2 if exists else 3)
         assert len(queries) == len(calls)
         for query in queries:
             assert "FROM information_schema.columns" in query["QueryString"]
