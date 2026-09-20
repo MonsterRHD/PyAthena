@@ -151,12 +151,13 @@ class ComponentReflectionTestExtra(_ComponentReflectionTestExtra):
     @sa_testing.combinations(True, False, argnames="list_first")
     @sa_testing.combinations(True, False, argnames="cursor_catalog")
     def test_reuses_table_metadata(
-        self, connection, metadata, monkeypatch, list_first, cursor_catalog
+        self, connection, metadata, monkeypatch, caplog, list_first, cursor_catalog
     ):
         table = Table("listed_metadata", metadata, Column("id", Integer, comment="identifier"))
         table.create(connection)
         inspector = inspect(connection)
         raw_connection = _raw_connection(connection)
+        caplog.set_level(logging.WARNING, logger="pyathena.sqlalchemy.base")
         if cursor_catalog:
             monkeypatch.setitem(
                 raw_connection.cursor_kwargs, "catalog_name", raw_connection.catalog_name
@@ -178,6 +179,9 @@ class ComponentReflectionTestExtra(_ComponentReflectionTestExtra):
                 assert table.name not in inspector.get_view_names(schema=schema)
                 assert calls == listed_calls
             assert inspector.get_columns(table.name)[0]["comment"] == "identifier"
+            if any("information_schema" in record.getMessage() for record in caplog.records):
+                # The request counts below assume metadata served by the API.
+                pytest.skip("table metadata was throttled; columns came from information_schema")
             initial_calls = list(calls)
             assert inspector.get_columns(table.name, schema=schema)[0]["name"] == "id"
             assert inspector.get_table_options(table.name, schema=schema)["awsathena_location"]

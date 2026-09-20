@@ -330,14 +330,16 @@ class AthenaDialect(DefaultDialect):
         info_cache = kw.get("info_cache")
         if info_cache is None:
             info_cache = {}
-        metadata_key = ("pyathena_table_metadata", catalog, schema, name)
-        metadata = info_cache.get(metadata_key)
-        if metadata is not None:
-            return self._columns_from_metadata(metadata)
+        # Columns already reflected from information_schema stay in use until
+        # Inspector.clear_cache(), even if a later listing seeds full metadata.
         columns_key = ("pyathena_information_schema_columns", catalog, schema, name)
         columns = info_cache.get(columns_key)
         if columns is not None:
             return columns
+        metadata_key = ("pyathena_table_metadata", catalog, schema, name)
+        metadata = info_cache.get(metadata_key)
+        if metadata is not None:
+            return self._columns_from_metadata(metadata)
         # A throttled metadata request switches to information_schema at once
         # instead of waiting out the retry policy; the query answers existence
         # and columns, while table comments and options still need the API.
