@@ -75,16 +75,24 @@ class AsyncSparkCursor(SparkBaseCursor):
         max_workers: int = (cpu_count() or 1) * 5,
         **kwargs,
     ):
-        super().__init__(
-            session_id=session_id,
-            description=description,
-            engine_configuration=engine_configuration,
-            notebook_version=notebook_version,
-            session_idle_timeout_minutes=session_idle_timeout_minutes,
-            **kwargs,
-        )
+        # Create the executor before the base constructor registers the
+        # cursor and its session ownership, so a failure here (e.g. invalid
+        # max_workers) cannot leave a phantom owner in the registry.
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        try:
+            super().__init__(
+                session_id=session_id,
+                description=description,
+                engine_configuration=engine_configuration,
+                notebook_version=notebook_version,
+                session_idle_timeout_minutes=session_idle_timeout_minutes,
+                **kwargs,
+            )
+        except BaseException:
+            executor.shutdown(wait=False)
+            raise
         self._max_workers = max_workers
-        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        self._executor = executor
 
     def close(self, wait: bool = False) -> None:
         """Close the cursor and shut down the worker pool.

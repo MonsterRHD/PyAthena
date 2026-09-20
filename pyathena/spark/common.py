@@ -112,24 +112,32 @@ class SparkBaseCursor(BaseCursor, metaclass=ABCMeta):
         )
 
         if session_id:
-            acquired = self.connection._spark_acquire_session(session_id)
-            if acquired == "terminating":
+            peeked = self.connection._spark_peek_session(session_id)
+            if peeked == "terminating":
                 raise OperationalError(
                     f"Session: {session_id} is being terminated by another cursor "
                     f"of this connection."
                 )
-            if acquired == "joined":
-                # Another cursor of this connection created the session; this
-                # cursor shares its ownership. Verify liveness because the
-                # session may have been terminated (e.g. idle timeout).
-                try:
-                    self._assert_session_usable(session_id)
-                except Exception:
-                    self.connection._spark_leave_session(session_id)
-                    raise
+            if peeked == "joined":
+                # Verify liveness (the session may have hit its idle timeout)
+                # before taking ownership, then atomically confirm the join so
+                # a concurrent last-owner close cannot strand the count.
+                self._assert_session_usable(session_id)
+                if not self.connection._spark_confirm_join(session_id):
+                    raise OperationalError(
+                        f"Session: {session_id} is being terminated by another cursor "
+                        f"of this connection."
+                    )
                 self._session_id = session_id
                 self._owns_session = True
             elif self._exists_session(session_id):
+                # Re-check under the registry lock: a last-owner close may have
+                # started terminating this exact session during the check.
+                if self.connection._spark_peek_session(session_id) != "unknown":
+                    raise OperationalError(
+                        f"Session: {session_id} is being terminated by another cursor "
+                        f"of this connection."
+                    )
                 # The session is managed outside this connection: borrow it.
                 self._session_id = session_id
                 self._owns_session = False
@@ -185,11 +193,12 @@ class SparkBaseCursor(BaseCursor, metaclass=ABCMeta):
         close could not have observed it.
 
         Returns:
-            True if the cursor has already fully closed.
+            True if close has already begun or finished; the caller must then
+            stop the calculation itself because this close cannot observe it.
         """
         with self._lock:
             self._calculations.setdefault(calculation_id, None)
-            return self._closed
+            return self._closing
 
     def _record_terminal_calculation(
         self, calculation_id: str, execution: AthenaCalculationExecution
@@ -455,7 +464,8 @@ class SparkBaseCursor(BaseCursor, metaclass=ABCMeta):
         with self._close_lock:
             if self._closed:
                 return
-            self._closing = True
+            with self._lock:
+                self._closing = True
             errors = self._stop_active_calculations()
             if errors:
                 raise OperationalError(

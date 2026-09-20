@@ -362,6 +362,52 @@ class TestSparkCursorOwnership:
             )
         assert conn._spark_session_owners["shared"] == 1
 
+    def test_join_confirm_rejects_session_released_during_liveness(self, conn):
+        owner = _make_cursor(conn, owned_session_id="shared")
+
+        def release_during_liveness(session_id) -> None:
+            # The owner reaches its close-release phase while this cursor is
+            # still performing its liveness check.
+            assert conn._spark_release_session("shared") is True
+
+        with (
+            patch.object(SparkCursor, "_start_session", return_value="shared"),
+            patch.object(SparkCursor, "_exists_session", return_value=True),
+            patch.object(
+                SparkCursor, "_assert_session_usable", side_effect=release_during_liveness
+            ),
+            pytest.raises(OperationalError, match="being terminated"),
+        ):
+            conn.cursor(
+                SparkCursor,
+                session_id="shared",
+                poll_interval=0,
+                kill_on_interrupt=False,
+            )
+        # The failed construction added neither an owner nor a cursor.
+        assert conn._spark_open_cursors() == (owner,)
+        assert conn._spark_session_owners == {}
+        conn._spark_mark_session_terminated("shared")
+
+    def test_start_returning_during_closing_phase_is_stopped(self, conn):
+        cursor = _make_cursor(conn, session_id="external")
+        _stub_calculation(cursor, [_status(RUNNING), _status(CANCELED)])
+
+        def start_while_closing(**kwargs) -> str:
+            # close set the closing flag but has not snapshotted/finished yet.
+            with cursor._lock:
+                cursor._closing = True
+            return "late-calc"
+
+        cursor._calculate = MagicMock(side_effect=start_while_closing)
+
+        with pytest.raises(ProgrammingError):
+            cursor.execute("print('late')")
+        cursor._connection.client.stop_calculation_execution.assert_called_once_with(
+            CalculationExecutionId="late-calc"
+        )
+        cursor._connection.client.terminate_session.assert_not_called()
+
 
 # --- connection close ---
 
@@ -406,6 +452,22 @@ class TestConnectionClose:
 
 
 class TestAsyncSparkCursorOwnership:
+    def test_invalid_max_workers_leaves_no_registered_owner(self, conn):
+        with (
+            patch.object(AsyncSparkCursor, "_start_session", return_value="owned-1"),
+            patch.object(AsyncSparkCursor, "_exists_session", return_value=True),
+            patch.object(AsyncSparkCursor, "_assert_session_usable"),
+            pytest.raises(ValueError, match="max_workers"),
+        ):
+            conn.cursor(
+                AsyncSparkCursor,
+                poll_interval=0,
+                kill_on_interrupt=False,
+                max_workers=0,
+            )
+        assert conn._spark_open_cursors() == ()
+        assert conn._spark_session_owners == {}
+
     def test_execute_registers_calculation_and_close_terminates_owned(self, conn):
         cursor = _make_cursor(conn, AsyncSparkCursor, owned_session_id="owned-1")
         execution = _status(COMPLETED)

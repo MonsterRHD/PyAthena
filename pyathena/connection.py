@@ -601,29 +601,36 @@ class Connection(Generic[ConnectionCursor]):
         with self._spark_lock:
             self._spark_session_owners[session_id] = 1
 
-    def _spark_acquire_session(self, session_id: str) -> str:
-        """Acquire access to a session while constructing a cursor.
+    def _spark_peek_session(self, session_id: str) -> str:
+        """Classify a session before a cursor performs liveness checks.
 
         Returns:
             "joined" when the session was created through this connection
-            and ownership was incremented, "terminating" while its last owner
-            is terminating it, or "unknown" when it is external (borrowed
-            subject to an existence check).
+            (ownership is not incremented yet), "terminating" while its last
+            owner is terminating it, or "unknown" when it is external.
         """
         with self._spark_lock:
             if session_id in self._spark_terminating_sessions:
                 return "terminating"
             if session_id in self._spark_session_owners:
-                self._spark_session_owners[session_id] += 1
                 return "joined"
             return "unknown"
 
-    def _spark_leave_session(self, session_id: str) -> None:
-        """Roll back an ownership increment from an aborted cursor creation."""
+    def _spark_confirm_join(self, session_id: str) -> bool:
+        """Atomically increment ownership after liveness checks succeed.
+
+        Returns False if the session became terminating or was released
+        between the peek and this confirmation, in which case the cursor
+        construction aborts without touching the count.
+        """
         with self._spark_lock:
-            owners = self._spark_session_owners.get(session_id, 0)
-            if owners > 0:
-                self._spark_session_owners[session_id] = owners - 1
+            if (
+                session_id in self._spark_terminating_sessions
+                or session_id not in self._spark_session_owners
+            ):
+                return False
+            self._spark_session_owners[session_id] += 1
+            return True
 
     def _spark_release_session(self, session_id: str) -> bool:
         """Release one ownership of a client-owned session.

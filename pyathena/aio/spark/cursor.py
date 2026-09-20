@@ -372,7 +372,8 @@ class AioSparkCursor(SparkBaseCursor, WithCalculationExecution):
         async with self._aclose_lock:
             if self._closed:
                 return
-            self._closing = True
+            with self._lock:
+                self._closing = True
             errors: list[Exception] = []
             for calculation_id in self._active_calculations():
                 try:
