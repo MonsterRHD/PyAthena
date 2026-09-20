@@ -132,7 +132,7 @@ class RetryConfig:
         Retries are applied to AWS API calls, not to SQL query execution.
         Query failures typically require manual intervention or query fixes.
         With the default settings, the exponential waits between attempts sum
-        to 63 seconds plus jitter, which outlasts the metadata API throttling
+        to 127 seconds plus jitter, which outlasts the metadata API throttling
         episodes observed under concurrent reflection. SDK retries configured
         on the boto3 client are a separate layer applied within each attempt.
         Recognized Glue error codes wrapped in Athena MetadataException are
@@ -142,7 +142,7 @@ class RetryConfig:
     def __init__(
         self,
         exceptions: Iterable[str] = THROTTLING_ERROR_CODES,
-        attempt: int = 7,
+        attempt: int = 8,
         multiplier: int = 1,
         max_delay: int = 100,
         exponential_base: int = 2,

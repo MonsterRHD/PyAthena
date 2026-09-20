@@ -178,7 +178,7 @@ def _throttling_error() -> ClientError:
 
 class TestRetryConfig:
     def test_default_attempts(self):
-        assert RetryConfig().attempt == 7
+        assert RetryConfig().attempt == 8
 
     @pytest.mark.parametrize("policy_type", [tuple, list, iter, str])
     def test_captures_exception_names(self, policy_type):
