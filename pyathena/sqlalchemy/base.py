@@ -399,7 +399,8 @@ class AthenaDialect(DefaultDialect):
             "nullable": True,
             "default": None,
             "autoincrement": False,
-            "comment": comment,
+            # An empty comment is no comment, whichever path reported it.
+            "comment": comment or None,
             "dialect_options": {"awsathena_partition": partition},
         }
 
@@ -424,15 +425,15 @@ class AthenaDialect(DefaultDialect):
                 result_reuse_enable=False,
             )
             rows = cursor.fetchall()
-        # Sort here: UNLOAD-backed cursors do not preserve ORDER BY. Cursors that
-        # read NULL as NaN or as an empty string must not turn a missing comment
-        # into a value; the metadata API reports no comment as None.
+        # Sort here: the query has no ORDER BY and UNLOAD-backed cursors do not
+        # preserve result order. A CSV-backed pandas cursor reads a missing
+        # comment as NaN, which _column() cannot recognize as empty.
         return [
             self._column(
                 column_name,
                 # Athena exposes Hive STRING as unbounded VARCHAR in information_schema.
                 "string" if data_type == "varchar" else data_type,
-                comment if isinstance(comment, str) and comment else None,
+                comment if isinstance(comment, str) else None,
                 extra_info == "partition key" or None,
             )
             for _, column_name, data_type, comment, extra_info in sorted(

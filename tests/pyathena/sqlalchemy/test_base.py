@@ -92,6 +92,18 @@ class TestAthenaDialect:
         assert "WHERE table_schema = 'my_schema' AND table_name = 'o''neil'" in operation
         assert kwargs == {"result_reuse_enable": False}
 
+    def test_empty_metadata_comment_is_no_comment(self):
+        # Glue can carry an empty comment, so the metadata path must agree with
+        # the information_schema path rather than reflecting it as a comment.
+        metadata = SimpleNamespace(
+            columns=[SimpleNamespace(name="id", type="integer", comment="")],
+            partition_keys=[SimpleNamespace(name="dt", type="varchar", comment="")],
+        )
+
+        columns = AthenaDialect()._columns_from_metadata(metadata)
+
+        assert [column["comment"] for column in columns] == [None, None]
+
     def test_without_throttling_retries_keeps_other_codes(self):
         policy = RetryConfig(
             exceptions=(
@@ -151,6 +163,39 @@ class TestAthenaDialect:
         assert list(info_cache) == [
             ("pyathena_information_schema_columns", "awsdatacatalog", "analytics", "events")
         ]
+
+    def test_empty_information_schema_result_is_a_missing_table(self):
+        # A throttled lookup that finds no columns means the table is absent, so
+        # has_table() can report False instead of propagating the throttling.
+        error = ClientError(
+            {"Error": {"Code": "ThrottlingException", "Message": "Rate exceeded"}},
+            "GetTableMetadata",
+        )
+
+        def get_table_metadata(table_name, **kwargs):
+            raise OperationalError(*error.args) from error
+
+        cursor = SimpleNamespace(
+            get_table_metadata=get_table_metadata,
+            execute=lambda operation, **kwargs: None,
+            fetchall=list,
+        )
+        raw_connection = SimpleNamespace(
+            cursor_kwargs={},
+            catalog_name="awsdatacatalog",
+            schema_name="default",
+            retry_config=RetryConfig(),
+            driver_connection=SimpleNamespace(
+                cursor=lambda **kwargs: contextlib.nullcontext(cursor)
+            ),
+        )
+        connection = SimpleNamespace(connection=raw_connection)
+        info_cache = {}
+
+        with pytest.raises(NoSuchTableError):
+            AthenaDialect()._get_columns(connection, "events", info_cache=info_cache)
+        # Absence is not cached as reflected columns.
+        assert info_cache == {}
 
     def test_get_table_matches_long_names_case_insensitively(self):
         # GetTableMetadata rejects names over 128 characters, so the lookup lists
@@ -630,10 +675,10 @@ class TestSQLAlchemyAthena:
         assert insp.has_table(table_name, schema=ENV.schema)
         columns = insp.get_columns(table_name, schema=ENV.schema)
 
-        # UNLOAD does not preserve ORDER BY, so this order comes from the
-        # client-side ordinal_position sort. A cursor that reads NULL as NaN or as
-        # an empty string must not turn the missing comment on col_string into a
-        # value.
+        # The fallback query has no ORDER BY, so this order comes from the
+        # client-side ordinal_position sort. A missing comment reaches the dialect
+        # as NaN from a CSV-backed pandas cursor and as an empty string from a
+        # CSV-backed arrow cursor; neither may become a value.
         assert [column["name"] for column in columns] == ["col_int", "col_string", "dt"]
         assert [column["comment"] for column in columns] == ["identifier", None, None]
         assert [column["dialect_options"]["awsathena_partition"] for column in columns] == [
@@ -646,9 +691,6 @@ class TestSQLAlchemyAthena:
         assert isinstance(columns[0]["type"], types.INTEGER)
         assert isinstance(columns[1]["type"], types.VARCHAR)
         assert isinstance(columns[2]["type"], types.VARCHAR)
-
-        # An empty result is absence, not a failed request.
-        assert not insp.has_table(f"{table_name}_does_not_exist", schema=ENV.schema)
 
     def test_char_length(self, engine):
         engine, conn = engine
