@@ -54,11 +54,13 @@ def unique_s3tables_table_name(base: str) -> str:
 
 class TestAthenaDialect:
     def test_columns_from_information_schema(self):
-        # Rows arrive unordered, and a cursor may read a NULL comment as NaN.
+        # Rows arrive unordered, and a cursor may read a NULL comment as NaN
+        # (pandas), as an empty string (arrow), or as None (polars).
         rows = [
-            ("3", "dt", "varchar", float("nan"), "partition key"),
+            ("4", "dt", "varchar", float("nan"), "partition key"),
             ("1", "id", "integer", "identifier", None),
             ("2", "payload", "row(a integer, b array(varchar))", None, None),
+            ("3", "label", "varchar", "", ""),
         ]
         executed = []
 
@@ -74,13 +76,14 @@ class TestAthenaDialect:
             raw_connection, "My_Schema", "O'Neil"
         )
 
-        assert [column["name"] for column in columns] == ["id", "payload", "dt"]
+        assert [column["name"] for column in columns] == ["id", "payload", "label", "dt"]
         assert isinstance(columns[0]["type"], types.INTEGER)
-        assert columns[0]["comment"] == "identifier"
         assert isinstance(columns[1]["type"], AthenaStruct)
         assert type(columns[2]["type"]) is types.String
-        assert columns[2]["comment"] is None
+        assert type(columns[3]["type"]) is types.String
+        assert [column["comment"] for column in columns] == ["identifier", None, None, None]
         assert [column["dialect_options"]["awsathena_partition"] for column in columns] == [
+            None,
             None,
             None,
             True,
@@ -88,6 +91,18 @@ class TestAthenaDialect:
         ((operation, kwargs),) = executed
         assert "WHERE table_schema = 'my_schema' AND table_name = 'o''neil'" in operation
         assert kwargs == {"result_reuse_enable": False}
+
+    def test_empty_metadata_comment_is_no_comment(self):
+        # Glue can carry an empty comment, so the metadata path must agree with
+        # the information_schema path rather than reflecting it as a comment.
+        metadata = SimpleNamespace(
+            columns=[SimpleNamespace(name="id", type="integer", comment="")],
+            partition_keys=[SimpleNamespace(name="dt", type="varchar", comment="")],
+        )
+
+        columns = AthenaDialect()._columns_from_metadata(metadata)
+
+        assert [column["comment"] for column in columns] == [None, None]
 
     def test_without_throttling_retries_keeps_other_codes(self):
         policy = RetryConfig(
@@ -148,6 +163,39 @@ class TestAthenaDialect:
         assert list(info_cache) == [
             ("pyathena_information_schema_columns", "awsdatacatalog", "analytics", "events")
         ]
+
+    def test_empty_information_schema_result_is_a_missing_table(self):
+        # A throttled lookup that finds no columns means the table is absent, so
+        # has_table() can report False instead of propagating the throttling.
+        error = ClientError(
+            {"Error": {"Code": "ThrottlingException", "Message": "Rate exceeded"}},
+            "GetTableMetadata",
+        )
+
+        def get_table_metadata(table_name, **kwargs):
+            raise OperationalError(*error.args) from error
+
+        cursor = SimpleNamespace(
+            get_table_metadata=get_table_metadata,
+            execute=lambda operation, **kwargs: None,
+            fetchall=list,
+        )
+        raw_connection = SimpleNamespace(
+            cursor_kwargs={},
+            catalog_name="awsdatacatalog",
+            schema_name="default",
+            retry_config=RetryConfig(),
+            driver_connection=SimpleNamespace(
+                cursor=lambda **kwargs: contextlib.nullcontext(cursor)
+            ),
+        )
+        connection = SimpleNamespace(connection=raw_connection)
+        info_cache = {}
+
+        with pytest.raises(NoSuchTableError):
+            AthenaDialect()._get_columns(connection, "events", info_cache=info_cache)
+        # Absence is not cached as reflected columns.
+        assert info_cache == {}
 
     def test_get_table_matches_long_names_case_insensitively(self):
         # GetTableMetadata rejects names over 128 characters, so the lookup lists
@@ -583,6 +631,90 @@ class TestSQLAlchemyAthena:
         assert actual["default"] is None
         assert not actual["autoincrement"]
         assert actual["comment"] == "some comment"
+
+    # `unload` states what each case intends, independently of the URL the
+    # fixture builds, so the executed mode is compared against the intent.
+    @pytest.mark.parametrize(
+        ("engine", "unload"),
+        [
+            ({"driver": "pandas"}, False),
+            ({"driver": "pandas", "unload": "true"}, True),
+            ({"driver": "arrow"}, False),
+            ({"driver": "arrow", "unload": "true"}, True),
+            ({"driver": "polars"}, False),
+            ({"driver": "polars", "unload": "true"}, True),
+        ],
+        indirect=["engine"],
+    )
+    def test_throttled_columns_across_cursor_types(self, engine, unload, monkeypatch):
+        engine, conn = engine
+        # A per-case table, not a shared one created with checkfirst: this suite
+        # already contends for Athena's account-wide metadata API limit, and
+        # checkfirst would spend one GetTableMetadata call per case to save a
+        # DDL query that costs no metadata capacity at all.
+        table_name = f"test_throttled_columns_{uuid.uuid4().hex[:8]}"
+        Table(
+            table_name,
+            MetaData(schema=ENV.schema),
+            Column("col_int", types.Integer, comment="identifier"),
+            Column("col_string", types.String),
+            Column("dt", types.String, awsathena_partition=True),
+            awsathena_location=f"{ENV.s3_staging_dir}{ENV.schema}/{table_name}/",
+        ).create(bind=conn)
+
+        raw_connection = conn.connection.driver_connection
+        error = ClientError(
+            {"Error": {"Code": "ThrottlingException", "Message": "Rate exceeded"}},
+            "GetTableMetadata",
+        )
+
+        def fail_metadata(**kwargs):
+            raise error
+
+        # The retry policy is left alone: the fallback must not wait for it.
+        monkeypatch.setattr(raw_connection.client, "get_table_metadata", fail_metadata)
+        queries = []
+
+        def record_query(params, **kwargs):
+            queries.append(params["QueryString"])
+
+        event = "provide-client-params.athena.StartQueryExecution"
+        raw_connection.client.meta.events.register(event, record_query)
+        try:
+            # Inspect conn, not engine, which would open an unpatched connection.
+            insp = sqlalchemy.inspect(conn)
+            assert insp.has_table(table_name, schema=ENV.schema)
+            columns = insp.get_columns(table_name, schema=ENV.schema)
+        finally:
+            raw_connection.client.meta.events.unregister(event, record_query)
+
+        # Reflection issued the fallback and nothing else, in the mode this case
+        # asked for. Without the mode check, an unload option that stopped
+        # reaching the cursor would leave every case green while three of them
+        # silently tested CSV twice. The count is not pinned: a throttled
+        # StartQueryExecution is retried through the same client hook.
+        assert queries
+        for query in queries:
+            assert "FROM information_schema.columns" in query
+            assert query.strip().startswith("UNLOAD (") is unload
+
+        # The fallback query has no ORDER BY, so this order comes from the
+        # client-side ordinal_position sort, and every missing-comment shape a
+        # cursor can report has to arrive as None.
+        assert [column["name"] for column in columns] == ["col_int", "col_string", "dt"]
+        assert [column["comment"] for column in columns] == ["identifier", None, None]
+        assert [column["dialect_options"]["awsathena_partition"] for column in columns] == [
+            None,
+            None,
+            True,
+        ]
+        # Athena reports a Hive STRING as unbounded varchar in information_schema,
+        # and the fallback maps it back, so the types match the metadata API's.
+        assert [type(column["type"]) for column in columns] == [
+            types.INTEGER,
+            types.String,
+            types.String,
+        ]
 
     def test_char_length(self, engine):
         engine, conn = engine

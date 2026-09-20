@@ -399,7 +399,8 @@ class AthenaDialect(DefaultDialect):
             "nullable": True,
             "default": None,
             "autoincrement": False,
-            "comment": comment,
+            # An empty comment is no comment, whichever path reported it.
+            "comment": comment or None,
             "dialect_options": {"awsathena_partition": partition},
         }
 
@@ -424,8 +425,9 @@ class AthenaDialect(DefaultDialect):
                 result_reuse_enable=False,
             )
             rows = cursor.fetchall()
-        # Sort here: UNLOAD-backed cursors do not preserve ORDER BY. Cursors that
-        # read NULL as NaN must not turn a missing comment into a value.
+        # Sort here: the query has no ORDER BY and UNLOAD-backed cursors do not
+        # preserve result order. A CSV-backed pandas cursor reads a missing
+        # comment as NaN, which _column() cannot recognize as empty.
         return [
             self._column(
                 column_name,
@@ -487,7 +489,8 @@ class AthenaDialect(DefaultDialect):
         self, connection: Connection, table_name: str, schema: str | None = None, **kw
     ):
         metadata = self._get_table(connection, table_name, schema=schema, **kw)
-        return {"text": metadata.comment}
+        # An empty comment is no comment here too; the DDL compiler skips one.
+        return {"text": metadata.comment or None}
 
     def get_table_options(
         self, connection: Connection, table_name: str, schema: str | None = None, **kw
