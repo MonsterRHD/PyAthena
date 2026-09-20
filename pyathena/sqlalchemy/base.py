@@ -414,11 +414,12 @@ class AthenaDialect(DefaultDialect):
         # Athena resolves identifiers case-insensitively and information_schema
         # reports lowercase names; plain equality keeps the filter pushed down.
         # The answer must reflect the catalog now, so query result reuse is off.
+        schema = schema.lower().replace("'", "''")
+        table_name = table_name.lower().replace("'", "''")
         with raw_connection.driver_connection.cursor() as cursor:  # type: ignore[union-attr]
             cursor.execute(
                 "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema = %(schema)s AND table_name = %(table_name)s",
-                {"schema": schema.lower(), "table_name": table_name.lower()},
+                f"WHERE table_schema = '{schema}' AND table_name = '{table_name}'",
                 result_reuse_enable=False,
             )
             return cursor.fetchone() is not None
