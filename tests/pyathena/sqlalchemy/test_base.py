@@ -632,19 +632,21 @@ class TestSQLAlchemyAthena:
         assert not actual["autoincrement"]
         assert actual["comment"] == "some comment"
 
+    # `unload` states what each case intends, independently of the URL the
+    # fixture builds, so the executed mode is compared against the intent.
     @pytest.mark.parametrize(
-        "engine",
+        ("engine", "unload"),
         [
-            {"driver": "pandas"},
-            {"driver": "pandas", "unload": "true"},
-            {"driver": "arrow"},
-            {"driver": "arrow", "unload": "true"},
-            {"driver": "polars"},
-            {"driver": "polars", "unload": "true"},
+            ({"driver": "pandas"}, False),
+            ({"driver": "pandas", "unload": "true"}, True),
+            ({"driver": "arrow"}, False),
+            ({"driver": "arrow", "unload": "true"}, True),
+            ({"driver": "polars"}, False),
+            ({"driver": "polars", "unload": "true"}, True),
         ],
-        indirect=True,
+        indirect=["engine"],
     )
-    def test_throttled_columns_across_cursor_types(self, engine, monkeypatch):
+    def test_throttled_columns_across_cursor_types(self, engine, unload, monkeypatch):
         engine, conn = engine
         # The parametrized engines share one schema, so the first one creates the
         # table and the rest reuse it.
@@ -669,11 +671,28 @@ class TestSQLAlchemyAthena:
 
         # The retry policy is left alone: the fallback must not wait for it.
         monkeypatch.setattr(raw_connection.client, "get_table_metadata", fail_metadata)
+        queries = []
 
-        # Inspect conn, not engine, which would open an unpatched connection.
-        insp = sqlalchemy.inspect(conn)
-        assert insp.has_table(table_name, schema=ENV.schema)
-        columns = insp.get_columns(table_name, schema=ENV.schema)
+        def record_query(params, **kwargs):
+            queries.append(params["QueryString"])
+
+        event = "provide-client-params.athena.StartQueryExecution"
+        raw_connection.client.meta.events.register(event, record_query)
+        try:
+            # Inspect conn, not engine, which would open an unpatched connection.
+            insp = sqlalchemy.inspect(conn)
+            assert insp.has_table(table_name, schema=ENV.schema)
+            columns = insp.get_columns(table_name, schema=ENV.schema)
+        finally:
+            raw_connection.client.meta.events.unregister(event, record_query)
+
+        # get_columns() reuses the reflected columns, so the fallback ran once,
+        # and it ran in the mode this case asked for. Without this, an unload
+        # option that stopped reaching the cursor would leave every case green
+        # while three of them silently tested CSV twice.
+        (fallback,) = queries
+        assert "FROM information_schema.columns" in fallback
+        assert fallback.strip().startswith("UNLOAD (") is unload
 
         # The fallback query has no ORDER BY, so this order comes from the
         # client-side ordinal_position sort, and every missing-comment shape a
