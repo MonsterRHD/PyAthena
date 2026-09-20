@@ -648,9 +648,11 @@ class TestSQLAlchemyAthena:
     )
     def test_throttled_columns_across_cursor_types(self, engine, unload, monkeypatch):
         engine, conn = engine
-        # The parametrized engines share one schema, so the first one creates the
-        # table and the rest reuse it.
-        table_name = "test_throttled_columns"
+        # A per-case table, not a shared one created with checkfirst: this suite
+        # already contends for Athena's account-wide metadata API limit, and
+        # checkfirst would spend one GetTableMetadata call per case to save a
+        # DDL query that costs no metadata capacity at all.
+        table_name = f"test_throttled_columns_{uuid.uuid4().hex[:8]}"
         Table(
             table_name,
             MetaData(schema=ENV.schema),
@@ -658,7 +660,7 @@ class TestSQLAlchemyAthena:
             Column("col_string", types.String),
             Column("dt", types.String, awsathena_partition=True),
             awsathena_location=f"{ENV.s3_staging_dir}{ENV.schema}/{table_name}/",
-        ).create(bind=conn, checkfirst=True)
+        ).create(bind=conn)
 
         raw_connection = conn.connection.driver_connection
         error = ClientError(
