@@ -45,7 +45,13 @@ After changing dependencies, extras, or dependency groups in either `pyproject.t
 The benchmark lock includes metadata for its editable parent dependency; CI intentionally rejects a stale lock.
 
 Commands below run from `benchmarks/`.
-`plan` and `report` do not contact AWS.
+`plan` and `report` do not contact AWS or require `.env`.
+
+```bash
+cd benchmarks
+uv run --locked python -m pyathena_bench plan --suite single --scale small
+```
+
 For local AWS access, configure the profile and region in the repository root's gitignored `.env` file:
 
 ```dotenv
@@ -53,16 +59,11 @@ AWS_PROFILE=your-aws-profile
 AWS_DEFAULT_REGION=us-west-2
 ```
 
-Use `KEY=value` assignments and prefix local commands with `uv run --env-file ../.env` from `benchmarks/`.
+Use `KEY=value` assignments and prefix local AWS commands with `uv run --env-file ../.env` from `benchmarks/`.
 In a git worktree, run `just worktree-env` from the repository root once to link its `.env`.
 Leave the benchmark's `--profile` option and `[aws].profile` setting unset to use `AWS_PROFILE`.
 The harness still reads its region and workgroup from `config.toml`; keep these aligned with the target stack.
-On EC2, use the instance role and the commands shown below without loading the local `.env`.
-
-```bash
-cd benchmarks
-uv run --env-file ../.env --locked python -m pyathena_bench plan --suite single --scale small
-```
+The EC2 instructions in [Disposable EC2 environment](#disposable-ec2-environment) use the instance role without loading the local `.env`.
 
 Review the case count before running a suite.
 `run` requires explicit suite and scale selections and never overwrites an existing output directory.

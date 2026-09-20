@@ -35,7 +35,7 @@ Edit the canonical files when maintaining these skills so both agents use the sa
 
 ```bash
 just format   # Auto-fix formatting and imports
-just lint   # Lint + format check + mypy
+just lint   # Python lint, format check, mypy, and CloudFormation validation
 ```
 
 ### Testing
@@ -85,7 +85,7 @@ export $(cat .env | xargs) && uv run pytest tests/pyathena/test_file.py -v
 
 ### Markdown Lint
 
-`docs/**/*.md` and project-root `*.md` files are linted with [markdownlint-cli2](https://github.com/DavidAnson/markdownlint-cli2). The config lives at `.markdownlint-cli2.jsonc`. CI runs lint + Sphinx build on PRs that touch docs (`.github/workflows/docs-lint.yaml`).
+`docs/**/*.md`, `benchmarks/*.md`, `scripts/**/*.md`, `cloudformation/**/*.md`, and project-root `*.md` files are linted with [markdownlint-cli2](https://github.com/DavidAnson/markdownlint-cli2). The config lives at `.markdownlint-cli2.jsonc`. CI runs lint + Sphinx build on PRs that touch docs (`.github/workflows/docs-lint.yaml`).
 
 `markdownlint-cli2` is pinned in `.mise.toml`, so [`mise`](https://mise.jdx.dev/) installs the exact version used in CI. Run locally:
 
