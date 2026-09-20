@@ -297,7 +297,7 @@ class AthenaArray(sqltypes.ARRAY[Any]):
     def bind_expression(self, bindvalue):
         """Cast a bound ARRAY value to its declared Athena element type."""
         # The cast also gives empty arrays and NULL-only arrays their element type.
-        return cast(bindvalue, self)
+        return cast(bindvalue, self)._annotate({"_pyathena_array_bind": True})
 
     def bind_processor(self, dialect):
         """Return a processor that marks native ARRAY, MAP, and ROW parameters."""
@@ -353,11 +353,13 @@ class _ArrayResult(ColumnElement[Any]):
     _traverse_internals = [  # noqa: RUF012
         ("element", InternalTraversal.dp_clauseelement),
         ("type", InternalTraversal.dp_type),
+        ("array_type", InternalTraversal.dp_type),
     ]
 
     def __init__(self, element, type_):
         self.element = element
-        self.type = type_
+        self.type = element.type
+        self.array_type = type_
 
 
 def _array_item_type(type_: sqltypes.ARRAY[Any]) -> TypeEngine[Any]:
@@ -375,7 +377,8 @@ def _complex_values(value: Any, type_: TypeEngine[Any]):
     if isinstance(type_, sqltypes.ARRAY):
         if not isinstance(value, (list, tuple)):
             raise TypeError("ARRAY values must be lists or tuples.")
-        return "ARRAY", [(item, _array_item_type(type_)) for item in value]
+        item_type = _array_item_type(type_)
+        return "ARRAY", [(item, item_type) for item in value]
     if isinstance(type_, AthenaMap):
         if not isinstance(value, Mapping):
             raise TypeError("MAP values must be mappings.")
@@ -509,9 +512,8 @@ def _decode_complex(
     if value is None:
         return None
     if isinstance(type_, sqltypes.ARRAY):
-        items = [
-            _decode_complex(item, _array_item_type(type_), as_tuple, dialect) for item in value
-        ]
+        item_type = _array_item_type(type_)
+        items = [_decode_complex(item, item_type, as_tuple, dialect) for item in value]
         return tuple(items) if as_tuple else items
     if isinstance(type_, AthenaMap):
         map_items = value.items() if isinstance(value, dict) else value

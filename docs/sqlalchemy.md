@@ -1037,13 +1037,19 @@ Set `as_tuple=True` to return tuples at each array dimension instead of lists.
 Bound parameters, multiple parameter sets, and SQLAlchemy literals use Athena's `ARRAY[...]` constructors.
 An empty list represents an empty array, `None` represents SQL NULL, and individual elements can also be NULL.
 Ordinary DB API list and tuple parameters retain their existing `IN (...)` formatting.
+For decimal binds, specify `Numeric(precision, scale)`; a precision-free `Numeric()` raises a compilation error because Athena's bare DECIMAL cast would round fractional values to scale zero.
+Athena `Float` uses 32-bit REAL values; use `Double` for 64-bit floating-point elements.
 
 Typed SQLAlchemy SELECT expressions use a JSON transport projection to preserve nested values and strings containing commas, quotes, whitespace, or the word `null`.
-Scalar leaves are decoded according to the declared type, preserving decimal precision, dates, timestamps, and binary values.
+Scalar leaves for supported Athena table types are decoded according to the declared type, preserving decimal precision, dates, timestamps, and binary values.
 SQL predicates and intermediate subqueries still operate on native arrays.
 Arrays with unknown (`NullType`) elements keep the cursor's native conversion instead of using typed transport.
 For ordered typed ARRAY results, use SQLAlchemy column expressions.
 Textual ORDER BY clauses may name selected columns (including comma-separated names and direction/null placement); other textual expressions raise a compilation error to prevent ordering serialized values or referring to columns outside their scope.
+String label references such as `.order_by("id")` also resolve FROM-table columns using SQLAlchemy's normal rules.
+Ordered, DISTINCT, and compound ARRAY queries require explicit SELECT columns: use SQLAlchemy column expressions or `literal_column()` instead of `text()` projections, and `select(table)` instead of a wildcard.
+This avoids dropping unnamed columns or exposing internal ordering columns when the result is wrapped.
+An outer `TypeDecorator` retains its result processor as well as native ARRAY ordering.
 Raw `text()` queries and direct DB API queries retain the cursor's existing conversion behavior described below; they do not receive this projection automatically.
 
 Compared with earlier releases, reflected ARRAY columns are no longer reported as `String`.
@@ -1102,7 +1108,8 @@ result = connection.execute(
     text("SELECT ARRAY[ROW('Alice', 25), ROW('Bob', 30)] as users")
 ).fetchone()
 
-users = result.users  # [{"0": "Alice", "1": 25}, {"0": "Bob", "1": 30}]
+users = result.users
+# Use typed SQLAlchemy expressions when you need declared ROW field types.
 
 # Using CAST AS JSON for complex ARRAY operations
 result = connection.execute(

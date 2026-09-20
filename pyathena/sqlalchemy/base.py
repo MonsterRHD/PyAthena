@@ -545,7 +545,11 @@ class AthenaDialect(DefaultDialect):
             length = None
 
         if name == "array":
-            return AthenaArray(self._get_column_type(length, _nested=True) if length else None)
+            try:
+                return AthenaArray(self._get_column_type(length, _nested=True) if length else None)
+            except (TypeError, ValueError):
+                util.warn(f"Did not recognize type '{type_}'")
+                return types.NullType()
         if _nested and name == "map" and length:
             key, value = _split_type_arguments(length)
             return AthenaMap(

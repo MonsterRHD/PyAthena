@@ -15,6 +15,7 @@ from sqlalchemy import (
     Table,
     cast,
     literal,
+    literal_column,
     select,
     text,
     types,
@@ -567,3 +568,124 @@ def test_array_pickle_type_uses_overridden_processors():
     bound = array.bind_processor(dialect)([5])
     assert pickle.loads(bound.values[0]) == 5
     assert array.result_processor(dialect, None)(json.dumps([bound.values[0].hex()])) == [5]
+
+
+def test_array_ordering_resolves_unselected_from_columns():
+    table = Table(
+        "arrays", MetaData(), Column("id", Integer), Column("items", AthenaArray(Integer))
+    )
+    statement = select(table.c["items"]).order_by("id")
+    sql = str(statement.compile(dialect=AthenaDialect()))
+    assert "arrays.id AS _pyathena_order_0" in sql
+    assert "ORDER BY anon_1._pyathena_order_0" in sql
+
+
+def test_array_ordering_resolves_qualified_selected_label():
+    table = Table("arrays", MetaData(), Column("items", AthenaArray(Integer)))
+    sql = str(select(table.c["items"]).order_by("arrays_items").compile(dialect=AthenaDialect()))
+    assert "ORDER BY anon_1.items" in sql
+
+
+def test_array_ordering_unknown_label_raises_compile_error():
+    table = Table("arrays", MetaData(), Column("items", AthenaArray(Integer)))
+    with pytest.raises(sa_exc.CompileError, match="resolve ARRAY ORDER BY label"):
+        select(table).order_by("missing").compile(dialect=AthenaDialect())
+
+
+@pytest.mark.parametrize(
+    "projection", [text("id"), literal_column("*"), literal_column("arrays.*")]
+)
+@pytest.mark.parametrize("operation", ["order_by", "distinct", "union_all"])
+def test_array_rewrite_rejects_untracked_projection(projection, operation):
+    table = Table(
+        "arrays", MetaData(), Column("id", Integer), Column("items", AthenaArray(Integer))
+    )
+    statement = select(projection, table.c["items"])
+    if operation == "order_by":
+        statement = statement.order_by(table.c.id)
+    elif operation == "distinct":
+        statement = statement.distinct()
+    else:
+        statement = statement.union_all(statement)
+    with pytest.raises(sa_exc.CompileError, match="explicit SELECT columns"):
+        statement.compile(dialect=AthenaDialect())
+
+
+def test_array_rewrite_keeps_explicit_literal_columns():
+    table = Table(
+        "arrays", MetaData(), Column("id", Integer), Column("items", AthenaArray(Integer))
+    )
+    sql = str(
+        select(literal_column("id"), table.c["items"])
+        .order_by(table.c["items"])
+        .compile(dialect=AthenaDialect())
+    )
+    assert sql.startswith("SELECT anon_1.id, json_format(")
+
+
+class TupleArray(types.TypeDecorator):
+    impl = AthenaArray(Integer)
+    cache_ok = True
+
+    def process_result_value(self, value, dialect):
+        return tuple(value) if value is not None else None
+
+
+@pytest.mark.parametrize("compound", [False, True])
+def test_decorated_array_keeps_native_ordering_and_result_processor(compound):
+    dialect = AthenaDialect()
+    statement = select(literal([10], TupleArray()).label("items"))
+    if compound:
+        statement = statement.union_all(select(literal([2], TupleArray()).label("items")))
+    compiled = statement.order_by("items").compile(dialect=dialect)
+    assert "ORDER BY anon_1.items" in str(compiled)
+    result_type = compiled._result_columns[0].type
+    assert isinstance(result_type, TupleArray)
+    processor = result_type.dialect_impl(dialect).result_processor(dialect, None)
+    assert processor('{"_pyathena_array":["2",null]}') == (2, None)
+
+
+def test_array_variant_keeps_transport_and_result_types():
+    dialect = AthenaDialect()
+    type_ = String().with_variant(AthenaArray(Integer), "awsathena")
+    compiled = select(literal([2], type_).label("items")).order_by("items").compile(dialect=dialect)
+    assert "transform(anon_1.items" in str(compiled)
+    processor = (
+        compiled._result_columns[0].type.dialect_impl(dialect).result_processor(dialect, None)
+    )
+    assert processor('{"_pyathena_array":["2"]}') == [2]
+
+
+@pytest.mark.parametrize(
+    ("item_type", "value"),
+    [
+        (types.Numeric(), Decimal("1.50")),
+        (types.Numeric(scale=2), Decimal("1.50")),
+        (AthenaStruct(("amount", types.Numeric())), {"amount": Decimal("1.50")}),
+    ],
+)
+def test_array_decimal_bind_requires_precision(item_type, value):
+    statement = select(literal([value], AthenaArray(item_type)))
+    with pytest.raises(sa_exc.CompileError, match="explicit Numeric precision"):
+        statement.compile(dialect=AthenaDialect())
+
+
+def test_explicit_array_decimal_cast_keeps_default_precision():
+    value = literal([Decimal("1.50")], AthenaArray(types.Numeric(10, 2)))
+    sql = str(cast(value, AthenaArray(types.Numeric())).compile(dialect=AthenaDialect()))
+    assert sql == "CAST(CAST(%(param_1)s AS ARRAY(DECIMAL(10, 2))) AS ARRAY(DECIMAL))"
+
+
+@pytest.mark.parametrize(
+    "signature",
+    [
+        "array<map<int>>",
+        "array<struct<x>>",
+        "array<decimal(nope,2)>",
+        "array(row(integer, varchar))",
+    ],
+)
+def test_array_reflection_warns_for_unrecognized_nested_type(signature):
+    with pytest.warns(sa_exc.SAWarning, match="Did not recognize type"):
+        type_ = AthenaDialect()._get_column_type(signature)
+    assert isinstance(type_, types.NullType)

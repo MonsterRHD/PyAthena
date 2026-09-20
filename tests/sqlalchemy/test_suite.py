@@ -12,6 +12,7 @@ from sqlalchemy import (
     Integer,
     MetaData,
     String,
+    cast,
     func,
     inspect,
     literal,
@@ -142,6 +143,14 @@ class _ArrayJSONText(types.TypeDecorator):
         return _json.loads(value)
 
 
+class _ArrayTuple(types.TypeDecorator):
+    impl = AthenaArray(Integer)
+    cache_ok = True
+
+    def process_result_value(self, value, dialect):
+        return tuple(value) if value is not None else None
+
+
 class NativeArrayTest(fixtures.TestBase):
     __backend__ = True
     __requires__ = ("array_type",)
@@ -177,8 +186,34 @@ class NativeArrayTest(fixtures.TestBase):
             connection.execute(select(value, table.c.id).order_by(text("items DESC, id"))).all(),
             [([10], 1), ([2], 2), ([2], 3)],
         )
+        eq_(
+            connection.execute(select(value).order_by("id")).scalars().all(),
+            [[10], [2], [2]],
+        )
+        eq_(
+            connection.execute(select(table.c.value).order_by("native_array_order_value"))
+            .scalars()
+            .all(),
+            [[2], [2], [10]],
+        )
+
+    def test_decorated_array_ordering(self, connection):
+        values = select(literal([10], _ArrayTuple()).label("items")).union_all(
+            select(literal([2], _ArrayTuple()).label("items"))
+        )
+        eq_(connection.execute(values.order_by("items")).scalars().all(), [(2,), (10,)])
+        source = values.subquery()
+        statement = select(source.c["items"]).distinct().order_by("items")
+        eq_(connection.execute(statement).scalars().all(), [(2,), (10,)])
 
     def test_review_regressions(self, connection):
+        decimal_value = literal([Decimal("1.50")], AthenaArray(types.Numeric(10, 2)))
+        eq_(
+            connection.execute(
+                select(cast(decimal_value, AthenaArray(types.Numeric())))
+            ).scalar_one(),
+            [Decimal("2")],
+        )
         expressions = [
             literal(["a-very-long-string"], AthenaArray(String(3))),
             literal([0.1], AthenaArray(types.Double)),

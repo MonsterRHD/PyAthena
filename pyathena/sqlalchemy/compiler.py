@@ -22,6 +22,7 @@ from sqlalchemy.sql.elements import (
     _textual_label_reference,
 )
 from sqlalchemy.sql.schema import Column
+from sqlalchemy.sql.selectable import CompoundSelect
 
 from pyathena.model import (
     AthenaFileFormat,
@@ -262,10 +263,7 @@ class AthenaStatementCompiler(SQLCompiler):
             not self.stack
             and not kw.get("asfrom")
             and (select_stmt._distinct or select_stmt._order_by_clauses)
-            and any(
-                isinstance(column.type, types.ARRAY) and not _has_unknown_array_element(column.type)
-                for column in select_stmt.selected_columns
-            )
+            and any(self._has_array_result(column) for column in select_stmt.selected_columns)
         ):
             return self._array_result_select(select_stmt)
         return select_stmt
@@ -274,10 +272,7 @@ class AthenaStatementCompiler(SQLCompiler):
         if (
             not self.stack
             and not asfrom
-            and any(
-                isinstance(column.type, types.ARRAY) and not _has_unknown_array_element(column.type)
-                for column in cs.selected_columns
-            )
+            and any(self._has_array_result(column) for column in cs.selected_columns)
         ):
             original_columns = list(cs.selected_columns)
             rendered = self.process(self._array_result_select(cs), **kw)
@@ -288,15 +283,41 @@ class AthenaStatementCompiler(SQLCompiler):
             return rendered
         return super().visit_compound_select(cs, asfrom=asfrom, compound_index=compound_index, **kw)
 
+    def _has_array_result(self, column):
+        type_ = column.type.dialect_impl(self.dialect)
+        while isinstance(type_, types.TypeDecorator):
+            type_ = _decorator_impl(type_, self.dialect)
+        return isinstance(type_, types.ARRAY) and not _has_unknown_array_element(type_)
+
     def _array_result_select(self, statement):
+        if any(
+            isinstance(column, TextClause)
+            or (getattr(column, "is_literal", False) and column.name.rstrip().endswith("*"))
+            for column in statement._all_selected_columns
+        ):
+            raise exc.CompileError(
+                "Ordered, DISTINCT, and compound ARRAY results require explicit SELECT columns; "
+                "use SQLAlchemy column expressions or literal_column() instead of text(), "
+                "and select(table) instead of a wildcard"
+            )
         columns = list(statement.selected_columns)
         inner = statement.order_by(None).limit(None).offset(None)
         ordering = []
         hidden: list[Any] = []
+        label_resolve = (
+            dict(statement.selected_columns.items())
+            if isinstance(statement, CompoundSelect)
+            else statement._compile_state_factory(statement, self)._label_resolve_dict[0]
+        )
 
         def resolve_label(element: Any, **kw: Any) -> Any:
             if isinstance(element, _textual_label_reference):
-                return statement.selected_columns[element.element]
+                try:
+                    return label_resolve[element.element]
+                except KeyError as error:
+                    raise exc.CompileError(
+                        f"Can't resolve ARRAY ORDER BY label {element.element!r}"
+                    ) from error
             if isinstance(element, _label_reference):
                 return element.element
             return None
@@ -444,10 +465,10 @@ class AthenaStatementCompiler(SQLCompiler):
 
     def visit_cast(self, cast: Cast[Any], **kwargs):
         if isinstance(cast.type, (types.ARRAY, AthenaMap, AthenaStruct)):
-            return (
-                f"CAST({self.process(cast.clause, **kwargs)} "
-                f"AS {self._complex_dml_type(cast.type)})"
+            type_clause = self._complex_dml_type(
+                cast.type, implicit_bind=cast._annotations.get("_pyathena_array_bind", False)
             )
+            return f"CAST({self.process(cast.clause, **kwargs)} AS {type_clause})"
         if (isinstance(cast.type, types.VARCHAR) and cast.type.length is None) or isinstance(
             cast.type, types.String
         ):
@@ -467,21 +488,25 @@ class AthenaStatementCompiler(SQLCompiler):
             type_clause = cast.typeclause._compiler_dispatch(self, **kwargs)
         return f"CAST({cast.clause._compiler_dispatch(self, **kwargs)} AS {type_clause})"
 
-    def _complex_dml_type(self, type_):
+    def _complex_dml_type(self, type_, *, implicit_bind=False):
         if isinstance(type_, types.TypeDecorator):
-            return self._complex_dml_type(_decorator_impl(type_, self.dialect))
+            return self._complex_dml_type(
+                _decorator_impl(type_, self.dialect), implicit_bind=implicit_bind
+            )
         if isinstance(type_, types.NullType):
             raise exc.CompileError("Bound ARRAY values require an explicit element type")
         if isinstance(type_, types.ARRAY):
-            return f"ARRAY({self._complex_dml_type(_array_item_type(type_))})"
+            item = self._complex_dml_type(_array_item_type(type_), implicit_bind=implicit_bind)
+            return f"ARRAY({item})"
         if isinstance(type_, AthenaMap):
             return (
-                f"MAP({self._complex_dml_type(type_.key_type)}, "
-                f"{self._complex_dml_type(type_.value_type)})"
+                f"MAP({self._complex_dml_type(type_.key_type, implicit_bind=implicit_bind)}, "
+                f"{self._complex_dml_type(type_.value_type, implicit_bind=implicit_bind)})"
             )
         if isinstance(type_, AthenaStruct):
             fields = ", ".join(
-                f"{self.preparer.quote(name)} {self._complex_dml_type(field_type)}"
+                f"{self.preparer.quote(name)} "
+                f"{self._complex_dml_type(field_type, implicit_bind=implicit_bind)}"
                 for name, field_type in type_.fields.items()
             )
             return f"ROW({fields})"
@@ -493,11 +518,16 @@ class AthenaStatementCompiler(SQLCompiler):
             return "DOUBLE"
         if isinstance(type_, types.Float):
             return "REAL"
+        if implicit_bind and isinstance(type_, types.Numeric) and type_.precision is None:
+            raise exc.CompileError(
+                "ARRAY decimal binds require explicit Numeric precision; "
+                "specify precision and scale to avoid implicit rounding"
+            )
         return self.dialect.type_compiler_instance.process(type_)
 
     def visit_athena_array_result(self, expression, **kw):
         value = self.process(expression.element, **kw)
-        encoded = self._array_json(value, expression.type)
+        encoded = self._array_json(value, expression.array_type)
         # An object envelope keeps SQL NULL and CSV null markers out of the transport.
         return f"json_format(CAST(MAP(ARRAY['_pyathena_array'], ARRAY[{encoded}]) AS JSON))"
 
