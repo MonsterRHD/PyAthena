@@ -708,11 +708,12 @@ class TestSQLAlchemyAthena:
             None,
             True,
         ]
-        # information_schema names the types Athena uses there: STRING is varchar.
+        # Athena reports a Hive STRING as unbounded varchar in information_schema,
+        # and the fallback maps it back, so the types match the metadata API's.
         assert [type(column["type"]) for column in columns] == [
             types.INTEGER,
-            types.VARCHAR,
-            types.VARCHAR,
+            types.String,
+            types.String,
         ]
 
     def test_char_length(self, engine):
