@@ -33,12 +33,9 @@ jobs:
     uses: ./.github/workflows/test-suite.yaml
     with:
       test-type: sqla
-      # Metadata existence checks share account capacity across Python versions.
-      max-parallel: 2
 
   test-sqla-async:
     needs: [test-sqla]
     uses: ./.github/workflows/test-suite.yaml
     with:
       test-type: sqla_async
-      max-parallel: 2
