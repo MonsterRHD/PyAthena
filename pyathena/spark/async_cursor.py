@@ -105,6 +105,7 @@ class AsyncSparkCursor(SparkBaseCursor):
         self._raise_if_closing()
 
         def guarded() -> Any:
+            self._raise_if_closing()
             result = fn(*args)
             self._raise_if_closing()
             return result
