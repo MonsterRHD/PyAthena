@@ -152,7 +152,7 @@ class AsyncAdapt_pyathena_connection(AdaptedConnection):
         return AsyncAdapt_pyathena_cursor(raw_cursor)
 
     def close(self) -> None:
-        self._connection.close()
+        await_only(self._connection.aclose())
 
     def commit(self) -> None:
         self._connection.commit()  # type: ignore[unused-coroutine]

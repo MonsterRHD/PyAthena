@@ -127,7 +127,6 @@ class TestAioSparkCursor:
         async def cancel_after_delay(c):
             await asyncio.sleep(5)
             await c.cancel()
-            await c.close()
 
         task = asyncio.create_task(cancel_after_delay(aio_spark_cursor))
 
@@ -142,6 +141,9 @@ class TestAioSparkCursor:
             )
 
         await task
+        # The session stays usable after the calculation is canceled.
+        await aio_spark_cursor.execute("print('still alive')")
+        assert await aio_spark_cursor.get_std_out() == "still alive"
 
     async def test_executemany(self, aio_spark_cursor):
         with pytest.raises(NotSupportedError):

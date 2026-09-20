@@ -1,4 +1,5 @@
 import textwrap
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from random import randint
@@ -130,9 +131,6 @@ class TestSparkCursor:
             time.sleep(randint(5, 10))
             c.cancel()
 
-            # TODO: Calculation execution is not canceled unless session is terminated
-            c.close()
-
         with ThreadPoolExecutor(max_workers=1) as executor:
             executor.submit(cancel, spark_cursor)
 
@@ -147,6 +145,28 @@ class TestSparkCursor:
                     )
                 ),
             )
+        # The canceled calculation left the session usable for follow-ups.
+        spark_cursor.execute("print('still alive')")
+        assert spark_cursor.get_std_out() == "still alive"
+
+    def test_borrowed_session_survives_borrower_close(self):
+        from pyathena.connection import Connection
+
+        owner_conn = Connection(work_group=ENV.spark_work_group, schema_name=ENV.schema)
+        borrower_conn = Connection(work_group=ENV.spark_work_group, schema_name=ENV.schema)
+        try:
+            with owner_conn.cursor() as owner:
+                owner.execute("print('owner')")
+                session_id = owner.session_id
+                with borrower_conn.cursor(session_id=session_id) as borrower:
+                    borrower.execute("print('borrowed')")
+                # Closing the borrower must stop only its calculations and
+                # leave the caller-managed session running.
+                owner.execute("print('still alive')")
+                assert owner.get_std_out() == "still alive"
+        finally:
+            owner_conn.close()
+            borrower_conn.close()
 
 
 def test_spark_on_poll_invoked_each_iteration():
@@ -163,6 +183,9 @@ def test_spark_on_poll_invoked_each_iteration():
     cursor = SparkCursor.__new__(SparkCursor)  # bypass __init__ to avoid AWS calls
     cursor._poll_interval = 0
     cursor._kill_on_interrupt = False
+    cursor._lock = threading.RLock()
+    cursor._closing = False
+    cursor._calculations = {}
     cursor._on_poll = received.append
 
     with (

@@ -10,8 +10,13 @@ from pyathena.model import (
     AthenaCalculationExecution,
     AthenaCalculationExecutionStatus,
     AthenaQueryExecution,
+    AthenaSessionStatus,
 )
-from pyathena.spark.common import SparkBaseCursor, WithCalculationExecution
+from pyathena.spark.common import (
+    _TERMINAL_CALCULATION_STATES,
+    SparkBaseCursor,
+    WithCalculationExecution,
+)
 from pyathena.util import parse_output_location
 
 _logger = logging.getLogger(__name__)
@@ -58,6 +63,10 @@ class AioSparkCursor(SparkBaseCursor, WithCalculationExecution):
             session_idle_timeout_minutes=session_idle_timeout_minutes,
             **kwargs,
         )
+        # Serializes concurrent close() coroutines; created after the
+        # blocking base __init__ (which runs in asyncio.to_thread) and used
+        # only from the event loop thread.
+        self._aclose_lock = asyncio.Lock()
 
     @property
     def calculation_execution(self) -> AthenaCalculationExecution | None:
@@ -125,17 +134,35 @@ class AioSparkCursor(SparkBaseCursor, WithCalculationExecution):
             raise DatabaseError(*e.args) from e
         return cast(str, calculation_id)
 
+    async def _aget_session_status(self, session_id: str) -> AthenaSessionStatus:
+        request: dict[str, Any] = {"SessionId": session_id}
+        try:
+            response = await async_retry_api_call(
+                self._connection.client.get_session_status,
+                config=self._retry_config,
+                logger=_logger,
+                **request,
+            )
+        except Exception as e:
+            _logger.exception("Failed to get session status.")
+            raise OperationalError(*e.args) from e
+        else:
+            return AthenaSessionStatus(response)
+
     async def __poll(self, query_id: str) -> AthenaQueryExecution | AthenaCalculationExecution:
         while True:
+            self._raise_if_closing()
             calculation_status = await self._get_calculation_execution_status(query_id)
+            self._raise_if_closing()
             if self._on_poll:
                 self._on_poll(calculation_status)
-            if calculation_status.state in [
-                AthenaCalculationExecutionStatus.STATE_COMPLETED,
-                AthenaCalculationExecutionStatus.STATE_FAILED,
-                AthenaCalculationExecutionStatus.STATE_CANCELED,
-            ]:
-                return await self._get_calculation_execution(query_id)
+            if calculation_status.state in _TERMINAL_CALCULATION_STATES:
+                calculation_execution = await self._get_calculation_execution(query_id)
+                self._record_terminal_calculation(query_id, calculation_execution)
+                # Do not publish the result when close started while the
+                # terminal state was being fetched.
+                self._raise_if_closing()
+                return calculation_execution
             await asyncio.sleep(self._poll_interval)
 
     async def _poll(  # type: ignore[override]
@@ -144,7 +171,7 @@ class AioSparkCursor(SparkBaseCursor, WithCalculationExecution):
         try:
             query_execution = await self.__poll(query_id)
         except asyncio.CancelledError:
-            if self._kill_on_interrupt:
+            if self._kill_on_interrupt and not self._closing:
                 _logger.warning("Query canceled by user.")
                 await self._cancel(query_id)
                 query_execution = await self.__poll(query_id)
@@ -165,7 +192,40 @@ class AioSparkCursor(SparkBaseCursor, WithCalculationExecution):
             _logger.exception("Failed to cancel calculation.")
             raise OperationalError(*e.args) from e
 
+    async def _stop_calculation(  # type: ignore[override]
+        self, calculation_id: str
+    ) -> AthenaCalculationExecution:
+        """Async counterpart of the idempotent stop-and-reach-terminal flow."""
+        status = await self._get_calculation_execution_status(calculation_id)
+        if status.state not in _TERMINAL_CALCULATION_STATES:
+            try:
+                await async_retry_api_call(
+                    self._connection.client.stop_calculation_execution,
+                    config=self._retry_config,
+                    logger=_logger,
+                    CalculationExecutionId=calculation_id,
+                )
+            except Exception as e:
+                if not self._is_invalid_request_error(e):
+                    _logger.exception("Failed to stop calculation.")
+                    raise OperationalError(*e.args) from e
+                # The stop may be rejected because the calculation already
+                # reached a terminal state or the session is gone.
+                status = await self._get_calculation_execution_status(calculation_id)
+                if status.state not in _TERMINAL_CALCULATION_STATES:
+                    _logger.exception("Failed to stop calculation.")
+                    raise OperationalError(*e.args) from e
+        while True:
+            if status.state in _TERMINAL_CALCULATION_STATES:
+                break
+            await asyncio.sleep(self._poll_interval)
+            status = await self._get_calculation_execution_status(calculation_id)
+        execution = await self._get_calculation_execution(calculation_id)
+        self._record_terminal_calculation(calculation_id, execution)
+        return execution
+
     async def _terminate_session(self) -> None:  # type: ignore[override]
+        """Terminate the session; idempotent for an already terminated one."""
         request: dict[str, Any] = {"SessionId": self._session_id}
         try:
             await async_retry_api_call(
@@ -175,6 +235,13 @@ class AioSparkCursor(SparkBaseCursor, WithCalculationExecution):
                 **request,
             )
         except Exception as e:
+            # A racing termination (another owner path, idle timeout) leaves
+            # the session in TERMINATED; treat that as success.
+            if self._is_invalid_request_error(e):
+                session_status = await self._aget_session_status(self._session_id)
+                if session_status.state == AthenaSessionStatus.STATE_TERMINATED:
+                    _logger.warning("Session %s was already terminated.", self._session_id)
+                    return
             _logger.exception("Failed to terminate session.")
             raise OperationalError(*e.args) from e
 
@@ -196,20 +263,32 @@ class AioSparkCursor(SparkBaseCursor, WithCalculationExecution):
 
         Returns:
             The standard output as a string, or None if no output is available.
+
+        Raises:
+            ProgrammingError: If the cursor is closed or closing.
         """
+        self._raise_if_closing()
         if not self._calculation_execution or not self._calculation_execution.std_out_s3_uri:
             return None
-        return await self._read_s3_file_as_text(self._calculation_execution.std_out_s3_uri)
+        text = await self._read_s3_file_as_text(self._calculation_execution.std_out_s3_uri)
+        self._raise_if_closing()
+        return text
 
     async def get_std_error(self) -> str | None:
         """Get the standard error from the Spark calculation execution.
 
         Returns:
             The standard error as a string, or None if no error output is available.
+
+        Raises:
+            ProgrammingError: If the cursor is closed or closing.
         """
+        self._raise_if_closing()
         if not self._calculation_execution or not self._calculation_execution.std_error_s3_uri:
             return None
-        return await self._read_s3_file_as_text(self._calculation_execution.std_error_s3_uri)
+        text = await self._read_s3_file_as_text(self._calculation_execution.std_error_s3_uri)
+        self._raise_if_closing()
+        return text
 
     async def execute(  # type: ignore[override]
         self,
@@ -235,15 +314,22 @@ class AioSparkCursor(SparkBaseCursor, WithCalculationExecution):
         Returns:
             Self reference for method chaining.
         """
+        self._raise_if_closing()
         self._calculation_id = await self._calculate(
             session_id=session_id if session_id else self._session_id,
             code_block=operation,
             description=description,
             client_request_token=client_request_token,
         )
-        self._calculation_execution = cast(
+        # Register before polling so close stops a calculation whose poll
+        # fails or is cancelled.
+        self._register_calculation(self._calculation_id)
+        calculation_execution = cast(
             AthenaCalculationExecution, await self._poll(self._calculation_id)
         )
+        # A close that raced with the terminal poll owns publication now.
+        self._raise_if_closing()
+        self._calculation_execution = calculation_execution
         if self._calculation_execution.state != AthenaCalculationExecutionStatus.STATE_COMPLETED:
             std_error = await self.get_std_error()
             raise OperationalError(std_error)
@@ -260,8 +346,41 @@ class AioSparkCursor(SparkBaseCursor, WithCalculationExecution):
         await self._cancel(self.calculation_id)
 
     async def close(self) -> None:  # type: ignore[override]
-        """Close the cursor by terminating the Spark session."""
-        await self._terminate_session()
+        """Stop owned calculations and release the session per ownership.
+
+        Borrowed sessions are never terminated; the last owner of a
+        client-owned session terminates it. Concurrent calls are serialized:
+        the method is idempotent after success and retryable after a
+        failure, in which case it raises
+        :class:`~pyathena.error.OperationalError` describing the unfinished
+        remote cleanup.
+        """
+        async with self._aclose_lock:
+            if self._closed:
+                return
+            self._closing = True
+            errors: list[Exception] = []
+            for calculation_id in self._active_calculations():
+                try:
+                    await self._stop_calculation(calculation_id)
+                except Exception as e:  # noqa: PERF203
+                    _logger.exception("Failed to stop calculation %s.", calculation_id)
+                    errors.append(e)
+            if self._owns_session and self.connection._spark_release_session(self._session_id):
+                try:
+                    await self._terminate_session()
+                except Exception as e:
+                    # Keep the ownership claim so a later close() can retry.
+                    self.connection._spark_rearm_session(self._session_id)
+                    errors.append(e)
+            if errors:
+                raise OperationalError(
+                    f"Failed to fully close Spark cursor for session "
+                    f"{self._session_id}. Retrying close() reattempts the unfinished "
+                    f"cleanup; the session may still be running."
+                ) from errors[0]
+            self._closed = True
+            self.connection._spark_unregister_cursor(self)
 
     async def executemany(  # type: ignore[override]
         self,

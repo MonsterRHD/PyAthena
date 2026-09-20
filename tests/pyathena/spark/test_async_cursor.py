@@ -116,8 +116,9 @@ class TestAsyncSparkCursor:
         time.sleep(randint(5, 10))
         async_spark_cursor.cancel(query_id).result()
 
-        # TODO: Calculation execution is not canceled unless session is terminated
-        async_spark_cursor.close()
-
         calculation_execution = future.result()
         assert calculation_execution.state == AthenaCalculationExecutionStatus.STATE_CANCELED
+
+        # The session stays usable after the calculation is canceled.
+        query_id, future = async_spark_cursor.execute("print('still alive')")
+        assert future.result().state == AthenaCalculationExecutionStatus.STATE_COMPLETED

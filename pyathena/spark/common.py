@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from abc import ABCMeta, abstractmethod
 from datetime import datetime
@@ -8,7 +9,7 @@ from typing import Any, cast
 
 import botocore
 
-from pyathena import NotSupportedError, OperationalError
+from pyathena import NotSupportedError, OperationalError, ProgrammingError
 from pyathena.common import BaseCursor
 from pyathena.model import (
     AthenaCalculationExecution,
@@ -20,6 +21,14 @@ from pyathena.util import parse_output_location, retry_api_call
 
 _logger = logging.getLogger(__name__)
 
+_TERMINAL_CALCULATION_STATES = frozenset(
+    {
+        AthenaCalculationExecutionStatus.STATE_COMPLETED,
+        AthenaCalculationExecutionStatus.STATE_FAILED,
+        AthenaCalculationExecutionStatus.STATE_CANCELED,
+    }
+)
+
 
 class SparkBaseCursor(BaseCursor, metaclass=ABCMeta):
     """Abstract base class for Spark-enabled cursor implementations.
@@ -29,13 +38,20 @@ class SparkBaseCursor(BaseCursor, metaclass=ABCMeta):
     calculation execution lifecycle, and provides utilities for reading
     results from S3.
 
-    Features:
-        - Automatic Spark session management and lifecycle
-        - Configurable engine resources (DPU allocation)
-        - Session idle timeout and automatic cleanup
-        - Standard output and error stream access via S3
-        - Calculation execution status monitoring
-        - Session validation and error handling
+    Session ownership:
+        A session explicitly provided via ``session_id`` is *borrowed* unless
+        another cursor of the same connection started it. Closing a cursor
+        that borrows a session only stops the calculations started by that
+        cursor and never terminates the session. A session started by a
+        cursor is *client-owned*; ownership is reference counted on the
+        connection and only the last owner terminates the session.
+
+    Calculation ownership:
+        Every calculation started by a cursor is tracked. On close (or when
+        execute/cancel/poll races with close), calculations that have not
+        reached a terminal state are stopped idempotently and their terminal
+        state is awaited. Late polls and stdout/stderr/result reads after
+        close has begun raise instead of publishing data.
 
     Attributes:
         session_id: The Athena Spark session identifier.
@@ -66,13 +82,35 @@ class SparkBaseCursor(BaseCursor, metaclass=ABCMeta):
         self._session_description = description
         self._session_idle_timeout_minutes = session_idle_timeout_minutes
 
+        # State guarded by ``_lock`` for the thread-based async cursor, whose
+        # worker threads race with close() calls from other threads. The
+        # native asyncio cursor relies on cooperative scheduling and uses the
+        # same short critical sections without awaiting inside them.
+        self._lock = threading.RLock()
+        # Serializes concurrent close() calls so the session ownership
+        # count is released exactly once per cursor.
+        self._close_lock = threading.Lock()
+        # calculation ID -> terminal execution, or None while it may run
+        self._calculations: dict[str, AthenaCalculationExecution | None] = {}
+        self._closing = False
+        self._closed = False
+
         if session_id:
-            if self._exists_session(session_id):
+            if self.connection._spark_join_session(session_id):
+                # Another cursor of this connection created the session;
+                # this cursor shares its ownership.
                 self._session_id = session_id
+                self._owns_session = True
+            elif self._exists_session(session_id):
+                # The session is managed outside this connection: borrow it.
+                self._session_id = session_id
+                self._owns_session = False
             else:
                 raise OperationalError(f"Session: {session_id} not found.")
         else:
             self._session_id = self._start_session()
+            self.connection._spark_register_session(self._session_id)
+            self._owns_session = True
 
         self._calculation_id: str | None = None
         self._calculation_execution: AthenaCalculationExecution | None = None
@@ -83,6 +121,7 @@ class SparkBaseCursor(BaseCursor, metaclass=ABCMeta):
             config=self.connection.config,
             **self.connection._client_kwargs,
         )
+        self.connection._spark_register_cursor(self)
 
     @property
     def session_id(self) -> str:
@@ -92,6 +131,11 @@ class SparkBaseCursor(BaseCursor, metaclass=ABCMeta):
     def calculation_id(self) -> str | None:
         return self._calculation_id
 
+    @property
+    def is_closed(self) -> bool:
+        """True once close has completed successfully."""
+        return self._closed
+
     @staticmethod
     def get_default_engine_configuration() -> dict[str, Any]:
         return {
@@ -99,6 +143,38 @@ class SparkBaseCursor(BaseCursor, metaclass=ABCMeta):
             "MaxConcurrentDpus": 2,
             "DefaultExecutorDpuSize": 1,
         }
+
+    # --- close state and calculation ownership ---
+
+    def _raise_if_closing(self) -> None:
+        """Gate for operations that must not publish data during shutdown."""
+        if self._closing:
+            raise ProgrammingError("Operation on a closed or closing Spark cursor.")
+
+    def _register_calculation(self, calculation_id: str) -> None:
+        with self._lock:
+            self._calculations.setdefault(calculation_id, None)
+
+    def _record_terminal_calculation(
+        self, calculation_id: str, execution: AthenaCalculationExecution
+    ) -> None:
+        with self._lock:
+            self._calculations[calculation_id] = execution
+
+    def _active_calculations(self) -> list[str]:
+        with self._lock:
+            return [
+                calculation_id
+                for calculation_id, execution in self._calculations.items()
+                if execution is None
+            ]
+
+    @staticmethod
+    def _is_invalid_request_error(exc: Exception) -> bool:
+        return (
+            isinstance(exc, botocore.exceptions.ClientError)
+            and exc.response.get("Error", {}).get("Code") == "InvalidRequestException"
+        )
 
     def _read_s3_file_as_text(self, uri) -> str:
         bucket, key = parse_output_location(uri)
@@ -111,7 +187,7 @@ class SparkBaseCursor(BaseCursor, metaclass=ABCMeta):
         )
         return cast(str, response["Body"].read().decode("utf-8").strip())
 
-    def _get_session_status(self, session_id: str):
+    def _get_session_status(self, session_id: str) -> AthenaSessionStatus:
         request: dict[str, Any] = {"SessionId": session_id}
         try:
             response = retry_api_call(
@@ -131,7 +207,7 @@ class SparkBaseCursor(BaseCursor, metaclass=ABCMeta):
             session_status = self._get_session_status(session_id)
             if session_status.state in [AthenaSessionStatus.STATE_IDLE]:
                 break
-            if session_status in [
+            if session_status.state in [
                 AthenaSessionStatus.STATE_TERMINATED,
                 AthenaSessionStatus.STATE_DEGRADED,
                 AthenaSessionStatus.STATE_FAILED,
@@ -149,10 +225,7 @@ class SparkBaseCursor(BaseCursor, metaclass=ABCMeta):
                 **request,
             )
         except Exception as e:
-            if (
-                isinstance(e, botocore.exceptions.ClientError)
-                and e.response["Error"]["Code"] == "InvalidRequestException"
-            ):
+            if self._is_invalid_request_error(e):
                 _logger.exception(f"Session: {session_id} not found.")
                 return False
             raise OperationalError(*e.args) from e
@@ -186,6 +259,7 @@ class SparkBaseCursor(BaseCursor, metaclass=ABCMeta):
             return session_id
 
     def _terminate_session(self) -> None:
+        """Terminate the session; idempotent for an already terminated one."""
         request = {"SessionId": self._session_id}
         try:
             retry_api_call(
@@ -195,20 +269,35 @@ class SparkBaseCursor(BaseCursor, metaclass=ABCMeta):
                 **request,
             )
         except Exception as e:
+            # A racing termination (another owner path, idle timeout) leaves
+            # the session in TERMINATED; treat that as success.
+            if self._is_invalid_request_error(e) and self._is_session_terminated():
+                _logger.warning("Session %s was already terminated.", self._session_id)
+                return
             _logger.exception("Failed to terminate session.")
             raise OperationalError(*e.args) from e
 
+    def _is_session_terminated(self) -> bool:
+        try:
+            session_status = self._get_session_status(self._session_id)
+        except Exception:
+            return False
+        return session_status.state == AthenaSessionStatus.STATE_TERMINATED
+
     def __poll(self, query_id: str) -> AthenaQueryExecution | AthenaCalculationExecution:
         while True:
+            self._raise_if_closing()
             calculation_status = self._get_calculation_execution_status(query_id)
+            self._raise_if_closing()
             if self._on_poll:
                 self._on_poll(calculation_status)
-            if calculation_status.state in [
-                AthenaCalculationExecutionStatus.STATE_COMPLETED,
-                AthenaCalculationExecutionStatus.STATE_FAILED,
-                AthenaCalculationExecutionStatus.STATE_CANCELED,
-            ]:
-                return self._get_calculation_execution(query_id)
+            if calculation_status.state in _TERMINAL_CALCULATION_STATES:
+                calculation_execution = self._get_calculation_execution(query_id)
+                self._record_terminal_calculation(query_id, calculation_execution)
+                # Do not publish the result when close started while the
+                # terminal state was being fetched.
+                self._raise_if_closing()
+                return calculation_execution
             time.sleep(self._poll_interval)
 
     def _poll(self, query_id: str) -> AthenaQueryExecution | AthenaCalculationExecution:
@@ -236,8 +325,92 @@ class SparkBaseCursor(BaseCursor, metaclass=ABCMeta):
             _logger.exception("Failed to cancel calculation.")
             raise OperationalError(*e.args) from e
 
+    def _stop_calculation(self, calculation_id: str) -> AthenaCalculationExecution:
+        """Stop a calculation unless it already finished, then reach terminal.
+
+        Idempotent and safe under execute/cancel/close races: if the
+        calculation reaches a terminal state while the stop request is in
+        flight, or the stop races with an identical request, the terminal
+        execution is recorded and returned.
+        """
+        status = self._get_calculation_execution_status(calculation_id)
+        if status.state not in _TERMINAL_CALCULATION_STATES:
+            try:
+                retry_api_call(
+                    self._connection.client.stop_calculation_execution,
+                    config=self._retry_config,
+                    logger=_logger,
+                    CalculationExecutionId=calculation_id,
+                )
+            except Exception as e:
+                if not self._is_invalid_request_error(e):
+                    _logger.exception("Failed to stop calculation.")
+                    raise OperationalError(*e.args) from e
+                # The stop may be rejected because the calculation already
+                # reached a terminal state or the session is gone.
+                status = self._get_calculation_execution_status(calculation_id)
+                if status.state not in _TERMINAL_CALCULATION_STATES:
+                    _logger.exception("Failed to stop calculation.")
+                    raise OperationalError(*e.args) from e
+        while True:
+            if status.state in _TERMINAL_CALCULATION_STATES:
+                break
+            time.sleep(self._poll_interval)
+            status = self._get_calculation_execution_status(calculation_id)
+        execution = self._get_calculation_execution(calculation_id)
+        self._record_terminal_calculation(calculation_id, execution)
+        return execution
+
+    def _stop_active_calculations(self) -> list[Exception]:
+        errors: list[Exception] = []
+        for calculation_id in self._active_calculations():
+            try:
+                self._stop_calculation(calculation_id)
+            except Exception as e:  # noqa: PERF203
+                _logger.exception("Failed to stop calculation %s.", calculation_id)
+                errors.append(e)
+        return errors
+
+    def _release_owned_session(self) -> Exception | None:
+        if not self._owns_session:
+            return None
+        if not self.connection._spark_release_session(self._session_id):
+            return None
+        try:
+            self._terminate_session()
+        except Exception as e:
+            # Keep the ownership claim so a later close() retries the
+            # termination instead of pretending the session was cleaned up.
+            self.connection._spark_rearm_session(self._session_id)
+            return e
+        return None
+
     def close(self) -> None:
-        self._terminate_session()
+        """Stop owned calculations and release the session per ownership.
+
+        Borrowed sessions are never terminated; the last owner of a
+        client-owned session terminates it. Concurrent calls are serialized:
+        the method is idempotent after success and retryable after a
+        failure, in which case it raises
+        :class:`~pyathena.error.OperationalError` describing the unfinished
+        remote cleanup.
+        """
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closing = True
+            errors = self._stop_active_calculations()
+            session_error = self._release_owned_session()
+            if session_error is not None:
+                errors.append(session_error)
+            if errors:
+                raise OperationalError(
+                    f"Failed to fully close Spark cursor for session "
+                    f"{self._session_id}. Retrying close() reattempts the unfinished "
+                    f"cleanup; the session may still be running."
+                ) from errors[0]
+            self._closed = True
+            self.connection._spark_unregister_cursor(self)
 
     def executemany(
         self,

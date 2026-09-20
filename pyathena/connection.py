@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import inspect
 import logging
 import os
+import threading
 import time
 from collections.abc import Callable
 from typing import (
@@ -21,7 +23,7 @@ import pyathena
 from pyathena.common import BaseCursor, CursorIterator, OnPollCallback
 from pyathena.converter import Converter
 from pyathena.cursor import Cursor
-from pyathena.error import NotSupportedError, ProgrammingError
+from pyathena.error import NotSupportedError, OperationalError, ProgrammingError
 from pyathena.formatter import DefaultParameterFormatter, Formatter
 from pyathena.util import RetryConfig
 
@@ -339,6 +341,14 @@ class Connection(Generic[ConnectionCursor]):
         self.result_reuse_minutes = result_reuse_minutes
         self.on_start_query_execution = on_start_query_execution
         self.on_poll = on_poll
+        # Registry of Spark cursors created from this connection and the
+        # sessions they own. Cursors started without an explicit session_id
+        # register the new Athena session here; cursors given a session_id
+        # that matches a registered session join its ownership, while
+        # externally provided sessions are borrowed and never terminated.
+        self._spark_lock = threading.Lock()
+        self._spark_cursors: set[Any] = set()
+        self._spark_session_owners: dict[str, int] = {}
 
     def _assume_role(
         self,
@@ -567,17 +577,112 @@ class Connection(Generic[ConnectionCursor]):
             **kwargs,
         )
 
-    def close(self) -> None:
-        """Close the connection.
+    # --- Spark session and cursor registry ---
 
-        Closes the database connection. This method is provided for DB API 2.0
-        compatibility. Since Athena connections are stateless, this method
-        currently does not perform any actual cleanup operations.
+    def _spark_register_cursor(self, cursor: Any) -> None:
+        """Track an open Spark cursor so connection close can close it."""
+        with self._spark_lock:
+            self._spark_cursors.add(cursor)
+
+    def _spark_unregister_cursor(self, cursor: Any) -> None:
+        """Remove a Spark cursor after its close has fully succeeded."""
+        with self._spark_lock:
+            self._spark_cursors.discard(cursor)
+
+    def _spark_open_cursors(self) -> tuple[Any, ...]:
+        with self._spark_lock:
+            return tuple(self._spark_cursors)
+
+    def _spark_register_session(self, session_id: str) -> None:
+        """Register a session created by a cursor with a single owner."""
+        with self._spark_lock:
+            self._spark_session_owners[session_id] = 1
+
+    def _spark_join_session(self, session_id: str) -> bool:
+        """Join ownership of a session created through this connection.
+
+        Returns:
+            True if the session is client-owned and this cursor joined it,
+            False if the session is unknown to the connection (borrowed).
+        """
+        with self._spark_lock:
+            if session_id in self._spark_session_owners:
+                self._spark_session_owners[session_id] += 1
+                return True
+            return False
+
+    def _spark_release_session(self, session_id: str) -> bool:
+        """Release one ownership of a client-owned session.
+
+        Returns:
+            True if the caller was the last owner and must terminate the
+            session; the registration is removed atomically in that case.
+        """
+        with self._spark_lock:
+            owners = self._spark_session_owners.get(session_id)
+            if owners is None:
+                return False
+            if owners <= 1:
+                self._spark_session_owners.pop(session_id, None)
+                return True
+            self._spark_session_owners[session_id] = owners - 1
+            return False
+
+    def _spark_rearm_session(self, session_id: str) -> None:
+        """Restore ownership so a failed termination can be retried."""
+        with self._spark_lock:
+            self._spark_session_owners[session_id] = (
+                self._spark_session_owners.get(session_id, 0) + 1
+            )
+
+    def _close_spark_cursors(self) -> None:
+        """Close all open Spark cursors using the cursor close rules.
+
+        Each cursor stops the calculations it started and only terminates a
+        session when it is the last owner; borrowed sessions are left
+        running. Cursor close failures are collected and surfaced so the
+        caller can retry this method instead of assuming cleanup succeeded.
+        """
+        errors: list[Exception] = []
+        for cursor in self._spark_open_cursors():
+            close = cursor.close
+            if inspect.iscoroutinefunction(close):
+                errors.append(
+                    ProgrammingError(
+                        "Cannot close a native asyncio Spark cursor synchronously; "
+                        "await AioConnection.aclose() instead."
+                    )
+                )
+                continue
+            try:
+                close()
+            except Exception as e:
+                _logger.exception("Failed to close Spark cursor on connection close.")
+                errors.append(e)
+        if errors:
+            raise OperationalError(
+                "Failed to close one or more Spark cursors. Remote calculations or "
+                "sessions may still be running; retrying connection.close() reattempts "
+                "the unfinished cleanup."
+            ) from errors[0]
+
+    def close(self) -> None:
+        """Close the connection and its open Spark cursors.
+
+        Closing applies the same ownership rules as ``cursor.close()``:
+        calculations started by each cursor are stopped if still running,
+        sessions handed to cursors via ``session_id`` are left to their
+        caller, and the last cursor owning a client-created session
+        terminates it. If any cleanup fails, an error is raised and
+        ``close()`` remains safe to retry.
+
+        Ordinary SQL cursors hold no remote state and require no cleanup.
 
         Note:
             This method is called automatically when using the connection
             as a context manager (with statement).
         """
+        self._close_spark_cursors()
 
     def commit(self) -> None:
         """Commit any pending transaction.

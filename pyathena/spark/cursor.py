@@ -87,7 +87,11 @@ class SparkCursor(SparkBaseCursor, WithCalculationExecution):
         Returns:
             The standard output as a string, or None if no output is available
             or the calculation has not been executed.
+
+        Raises:
+            ProgrammingError: If the cursor is closed or closing.
         """
+        self._raise_if_closing()
         if not self._calculation_execution or not self._calculation_execution.std_out_s3_uri:
             return None
         return self._read_s3_file_as_text(self._calculation_execution.std_out_s3_uri)
@@ -102,7 +106,11 @@ class SparkCursor(SparkBaseCursor, WithCalculationExecution):
         Returns:
             The standard error as a string, or None if no error output is available
             or the calculation has not been executed.
+
+        Raises:
+            ProgrammingError: If the cursor is closed or closing.
         """
+        self._raise_if_closing()
         if not self._calculation_execution or not self._calculation_execution.std_error_s3_uri:
             return None
         return self._read_s3_file_as_text(self._calculation_execution.std_error_s3_uri)
@@ -117,15 +125,20 @@ class SparkCursor(SparkBaseCursor, WithCalculationExecution):
         work_group: str | None = None,
         **kwargs,
     ) -> SparkCursor:
+        self._raise_if_closing()
         self._calculation_id = self._calculate(
             session_id=session_id if session_id else self._session_id,
             code_block=operation,
             description=description,
             client_request_token=client_request_token,
         )
-        self._calculation_execution = cast(
-            AthenaCalculationExecution, self._poll(self._calculation_id)
-        )
+        # Register before polling so that execute/cancel/close races stop the
+        # remote calculation even if polling fails afterwards.
+        self._register_calculation(self._calculation_id)
+        calculation_execution = cast(AthenaCalculationExecution, self._poll(self._calculation_id))
+        # A close that raced with the terminal poll owns publication now.
+        self._raise_if_closing()
+        self._calculation_execution = calculation_execution
         if self._calculation_execution.state != AthenaCalculationExecutionStatus.STATE_COMPLETED:
             std_error = self.get_std_error()
             raise OperationalError(std_error)

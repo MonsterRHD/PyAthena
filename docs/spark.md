@@ -76,8 +76,31 @@ cursor = conn.cursor(session_idle_timeout_minutes=60,
                      })
 ```
 
-The session is not terminated until the close method of the cursor is called.
-You can use the context manager to automatically call the close method.
+#### Session ownership
+
+A session started by a cursor (no `session_id`) is *client-owned*. When several
+cursors of the same connection share such a session (by passing its id to later
+cursors), the connection reference counts the owners and the session is
+terminated only when the last owner closes.
+
+A session passed via `session_id` that the connection did not start is
+*borrowed* (for example an existing session handed to PyAthena by a data
+platform). Closing a borrowing cursor, or exiting its context, never
+terminates that session; the caller keeps managing it.
+
+Regardless of ownership, closing a cursor stops the calculations it started
+if they have not reached a terminal state, and waits for their terminal
+state. Stop and terminate requests are idempotent: concurrent execute,
+cancel, timeout and close paths converge safely, and a failed termination
+raises an error instead of pretending the close succeeded; calling
+`close()` again reattempts the unfinished cleanup. Poll results and
+stdout/stderr reads that arrive after close has started are not published.
+
+Closing the connection (`conn.close()`, or `await conn.aclose()` for the
+native asyncio connection) applies the same rules to its open Spark cursors.
+
+The cursor's client-owned session is terminated when the last owner closes
+it. You can use the context manager to automatically call the close method.
 
 ```python
 from pyathena import connect
@@ -88,6 +111,18 @@ conn = connect(work_group="YOUR_SPARK_WORKGROUP",
 with conn.cursor() as cursor:
     cursor.execute("...")
     ...
+```
+
+Borrowing a session keeps it running after the cursor closes:
+
+```python
+from pyathena import connect
+from pyathena.spark.cursor import SparkCursor
+
+# `session_id` is managed outside PyAthena (e.g. by a data platform).
+with conn.cursor(SparkCursor, session_id=session_id) as cursor:
+    cursor.execute("...")
+# The session is still alive here; only this cursor's calculations were stopped.
 ```
 
 ### Spark DataFrames
@@ -326,13 +361,16 @@ from pyathena.spark.async_cursor import AsyncSparkCursor
 conn = connect(work_group="YOUR_SPARK_WORKGROUP", cursor_class=AsyncSparkCursor)
 with conn.cursor() as cursor:
     calculation_id, future = cursor.execute("""spark.sql("SELECT * FROM many_rows")""")
-    cursor.cancel(calculation_id)  # The cancel method future object returns nothing.
-    # It is better not to get the result of cursor execution.
-    # Because it will be blocked until the session is terminated.
-    # future.result()
+    cursor.cancel(calculation_id).result()
+    # The calculation transitions to CANCELED; the session stays usable.
+    calculation_execution = future.result()
 ```
 
-NOTE: Currently it appears that the calculation is not canceled unless the session is terminated.
+Closing the cursor stops the calculations it started and releases its
+session under the same ownership rules as `SparkCursor`: a borrowed session
+is left running and the last owner of a client-created session terminates
+it. In-flight futures resolve with an exception instead of returning data
+that arrived after close started.
 
 (aio-spark-cursor)=
 
@@ -357,7 +395,12 @@ async with await aio_connect(work_group="YOUR_SPARK_WORKGROUP",
     print(await cursor.get_std_out())
 ```
 
-The cursor supports the async context manager for automatic session termination:
+The cursor supports the async context manager. Session and calculation
+ownership follows the same rules as `SparkCursor`: closing a borrowing
+cursor stops its calculations but leaves the caller-managed session
+running, while the last owner of a client-created session terminates it.
+Closing the connection with `await conn.aclose()` (or the async context
+manager) applies the same rules:
 
 ```python
 import asyncio

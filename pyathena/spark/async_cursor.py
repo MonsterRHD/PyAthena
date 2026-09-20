@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from multiprocessing import cpu_count
 from typing import TYPE_CHECKING, Any, cast
@@ -17,16 +18,14 @@ class AsyncSparkCursor(SparkBaseCursor):
 
     This cursor provides asynchronous execution of PySpark code on Athena's managed
     Spark environment. It's designed for non-blocking big data processing, ETL
-    operations, and machine learning workloads that require Spark's distributed
-    computing capabilities without blocking the main thread.
+    operations, and machine learning workloads without blocking the main thread.
 
-    Features:
-        - Asynchronous PySpark code execution with concurrent futures
-        - Non-blocking query submission and result polling
-        - Managed Spark sessions with configurable resources
-        - Access to standard output and error streams asynchronously
-        - Automatic session lifecycle management
-        - Thread pool executor for concurrent operations
+    Session and calculation ownership follows the same rules as the synchronous
+    :class:`~pyathena.spark.cursor.SparkCursor`: borrowed sessions are never
+    terminated, the last owner of a client-created session terminates it, and
+    close stops only the calculations the cursor started. Worker tasks that
+    are still running when close begins resolve with an exception instead of
+    publishing late data.
 
     Attributes:
         max_workers: Maximum number of worker threads for async operations.
@@ -87,34 +86,67 @@ class AsyncSparkCursor(SparkBaseCursor):
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
 
     def close(self, wait: bool = False) -> None:
-        super().close()
-        self._executor.shutdown(wait=wait)
+        """Close the cursor and shut down the worker pool.
+
+        Calculations started by this cursor are stopped if still running and
+        the session is released per ownership. The shutdown of the thread
+        pool follows ``wait``; with the default ``wait=False`` in-flight
+        futures resolve with an exception rather than late data.
+
+        Args:
+            wait: Block until all submitted futures complete.
+        """
+        try:
+            super().close()
+        finally:
+            self._executor.shutdown(wait=wait)
+
+    def _submit(self, fn: Callable[..., Any], *args: Any) -> Future[Any]:
+        self._raise_if_closing()
+
+        def guarded() -> Any:
+            result = fn(*args)
+            self._raise_if_closing()
+            return result
+
+        return self._executor.submit(guarded)
 
     def calculation_execution(self, query_id: str) -> "Future[AthenaCalculationExecution]":
-        return self._executor.submit(self._get_calculation_execution, query_id)
+        return cast(
+            "Future[AthenaCalculationExecution]",
+            self._submit(self._get_calculation_execution, query_id),
+        )
 
     def get_std_out(
         self, calculation_execution: AthenaCalculationExecution
     ) -> "Future[str] | None":
+        self._raise_if_closing()
         if not calculation_execution.std_out_s3_uri:
             return None
-        return self._executor.submit(
-            self._read_s3_file_as_text, calculation_execution.std_out_s3_uri
-        )
+
+        def read_std_out() -> str:
+            text = self._read_s3_file_as_text(calculation_execution.std_out_s3_uri)
+            self._raise_if_closing()
+            return text
+
+        return self._executor.submit(read_std_out)
 
     def get_std_error(
         self, calculation_execution: AthenaCalculationExecution
     ) -> "Future[str] | None":
+        self._raise_if_closing()
         if not calculation_execution.std_error_s3_uri:
             return None
-        return self._executor.submit(
-            self._read_s3_file_as_text, calculation_execution.std_error_s3_uri
-        )
+
+        def read_std_error() -> str:
+            text = self._read_s3_file_as_text(calculation_execution.std_error_s3_uri)
+            self._raise_if_closing()
+            return text
+
+        return self._executor.submit(read_std_error)
 
     def poll(self, query_id: str) -> "Future[AthenaCalculationExecution]":
-        return cast(
-            "Future[AthenaCalculationExecution]", self._executor.submit(self._poll, query_id)
-        )
+        return cast("Future[AthenaCalculationExecution]", self._submit(self._poll, query_id))
 
     def execute(
         self,
@@ -126,13 +158,18 @@ class AsyncSparkCursor(SparkBaseCursor):
         work_group: str | None = None,
         **kwargs,
     ) -> tuple[str, "Future[AthenaQueryExecution | AthenaCalculationExecution]"]:
+        self._raise_if_closing()
         calculation_id = self._calculate(
             session_id=session_id if session_id else self._session_id,
             code_block=operation,
             description=description,
             client_request_token=client_request_token,
         )
-        return calculation_id, self._executor.submit(self._poll, calculation_id)
+        # Register before the future starts so close stops the calculation
+        # even if execute's caller never inspects the future.
+        self._register_calculation(calculation_id)
+        return calculation_id, self._submit(self._poll, calculation_id)
 
     def cancel(self, query_id: str) -> "Future[None]":
+        self._raise_if_closing()
         return self._executor.submit(self._cancel, query_id)
