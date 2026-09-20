@@ -11,6 +11,7 @@ from sqlalchemy.testing.schema import Column, Table
 from sqlalchemy.testing.suite import *  # noqa: F403
 from sqlalchemy.testing.suite import ComponentReflectionTest as _ComponentReflectionTest
 from sqlalchemy.testing.suite import ComponentReflectionTestExtra as _ComponentReflectionTestExtra
+from sqlalchemy.testing.suite import CTETest as _CTETest
 from sqlalchemy.testing.suite import FetchLimitOffsetTest as _FetchLimitOffsetTest
 from sqlalchemy.testing.suite import HasTableTest as _HasTableTest
 from sqlalchemy.testing.suite import InsertBehaviorTest as _InsertBehaviorTest
@@ -54,7 +55,6 @@ def _fail_get_table_metadata(monkeypatch, raw_connection, error, attempt=1):
 
 del BinaryTest  # noqa: F821
 del CompositeKeyReflectionTest  # noqa: F821
-del CTETest  # noqa: F821
 del DateTimeMicrosecondsTest  # noqa: F821
 del DifficultParametersTest  # noqa: F821
 del DistinctOnTest  # noqa: F821
@@ -65,6 +65,14 @@ del TimeMicrosecondsTest  # noqa: F821
 del TimeTest  # noqa: F821
 del TimestampMicrosecondsTest  # noqa: F821
 del UuidTest  # noqa: F821
+
+
+class CTETest(_CTETest):
+    @classmethod
+    def define_tables(cls, metadata):
+        super().define_tables(metadata)
+        # The suite removes unsupported foreign keys, so parent_id cannot infer its type.
+        metadata.tables["some_table"].c.parent_id.type = Integer()
 
 
 class SimpleUpdateDeleteTest(_SimpleUpdateDeleteTest):
