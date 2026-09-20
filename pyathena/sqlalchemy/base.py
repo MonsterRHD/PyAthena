@@ -425,13 +425,14 @@ class AthenaDialect(DefaultDialect):
             )
             rows = cursor.fetchall()
         # Sort here: UNLOAD-backed cursors do not preserve ORDER BY. Cursors that
-        # read NULL as NaN must not turn a missing comment into a value.
+        # read NULL as NaN or as an empty string must not turn a missing comment
+        # into a value; the metadata API reports no comment as None.
         return [
             self._column(
                 column_name,
                 # Athena exposes Hive STRING as unbounded VARCHAR in information_schema.
                 "string" if data_type == "varchar" else data_type,
-                comment if isinstance(comment, str) else None,
+                comment if isinstance(comment, str) and comment else None,
                 extra_info == "partition key" or None,
             )
             for _, column_name, data_type, comment, extra_info in sorted(
