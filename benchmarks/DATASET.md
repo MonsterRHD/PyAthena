@@ -21,7 +21,6 @@ It was exported on 2026-09-19 with a BigQuery extract job and copied to S3 witho
 | Total object bytes | 32,591,505,117 (approximately 30.4 GiB) |
 | Compression | Snappy |
 | Athena region / workgroup | `us-west-2` / `pyathena` |
-| Local AWS profile | `pyathena`; EC2 uses its instance role |
 | Minimum `timestamp` | `1789603200000000` (2026-09-17 00:00:00 UTC) |
 | Maximum `timestamp` | `1789689599000000` (2026-09-17 23:59:59 UTC) |
 
@@ -164,15 +163,16 @@ Retain the S3 source files, table, partition, and preparation evidence for subse
 
 ## Validation and preparation evidence
 
-The following metadata checks do not run Athena queries:
+Run these metadata checks from `benchmarks/` using the [local `.env` configuration](README.md#dependencies-and-local-checks).
+They do not run Athena queries:
 
 ```bash
-aws glue get-table --profile pyathena --region us-west-2 \
+uv run --env-file ../.env --locked aws glue get-table \
   --database-name pyathena_benchmark --name pypi_file_downloads
-aws glue get-partition --profile pyathena --region us-west-2 \
+uv run --env-file ../.env --locked aws glue get-partition \
   --database-name pyathena_benchmark --table-name pypi_file_downloads \
   --partition-values 2026-09-17
-aws s3api list-objects-v2 --profile pyathena --region us-west-2 \
+uv run --env-file ../.env --locked aws s3api list-objects-v2 \
   --bucket pyathena-benchmark \
   --prefix 'pypi_file_downloads/download_date=2026-09-17/' \
   --query '{objects:length(Contents),bytes:sum(Contents[].Size)}' --output json

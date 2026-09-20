@@ -130,7 +130,7 @@ Resources:
                   "s3:ListAllMyBuckets"
                 ]
                 Resource: [
-                  !Sub "arn:aws:s3:::*"
+                  "arn:aws:s3:::*"
                 ]
         - PolicyName: s3tables-access
           PolicyDocument:

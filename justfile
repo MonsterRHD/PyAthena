@@ -15,11 +15,12 @@ format:
     uvx ruff@{{RUFF_VERSION}} check --select I --fix .
     uvx ruff@{{RUFF_VERSION}} format .
 
-# Lint + format check + mypy
+# Lint, format check, mypy, and CloudFormation validation
 lint:
     uvx ruff@{{RUFF_VERSION}} check .
     uvx ruff@{{RUFF_VERSION}} format --check .
     uv run mypy .
+    uv run cfn-lint cloudformation/*.yaml
 
 # Run tests: just test (pyathena|sqla|sqla-async)
 test target="help":
@@ -94,3 +95,9 @@ _benchmark-test: _benchmark-lint
 tool:
     uv tool install ruff@{{RUFF_VERSION}}
     uv tool install tox@{{TOX_VERSION}} --with tox-uv --with tox-gh-actions
+
+# Check repository scripts without accessing AWS
+scripts: lint
+    mise exec -- shellcheck scripts/*.sh
+    mise exec -- actionlint
+    uv run --locked python -m pytest scripts/tests/ -q

@@ -89,6 +89,7 @@ dev = [
     "myst-parser",
     "sphinx-design",
     "types-python-dateutil",
+    "cfn-lint>=1",
 ]
 
 [build-system]
